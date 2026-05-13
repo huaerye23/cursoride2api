@@ -1,0 +1,172 @@
+{
+  "model": "claude-opus-4-7-thinking-max-fast",
+  "openedAt": 1778710166380,
+  "rounds": [
+    {
+      "idx": 1,
+      "send": "Hello — to confirm the connection, reply with exactly \"READY\" and nothing else, then yield.",
+      "recvText": "READY",
+      "recvMs": 1665,
+      "ttftMs": 1477,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 2,
+      "send": "What is 2 + 2? One-word answer.",
+      "recvText": "4",
+      "recvMs": 951,
+      "ttftMs": 760,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 3,
+      "send": "What is 7 times 8? One-word answer.",
+      "recvText": "56",
+      "recvMs": 1020,
+      "ttftMs": 817,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 4,
+      "send": "Capital of France? One word.",
+      "recvText": "Paris",
+      "recvMs": 1106,
+      "ttftMs": 942,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 5,
+      "send": "How many planets in the solar system? One number.",
+      "recvText": "8",
+      "recvMs": 1040,
+      "ttftMs": 848,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 6,
+      "send": "What was my first question in this conversation? Quote it briefly.",
+      "recvText": "\"Hello — to confirm the connection, reply with exactly 'READY' and nothing else, then yield.\"",
+      "recvMs": 2317,
+      "ttftMs": 2260,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 7,
+      "send": "Spell the word \"cat\" backwards.",
+      "recvText": "tac",
+      "recvMs": 834,
+      "ttftMs": 657,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 8,
+      "send": "What is the chemical symbol for gold?",
+      "recvText": "Au",
+      "recvMs": 903,
+      "ttftMs": 757,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 9,
+      "send": "Square root of 144?",
+      "recvText": "12",
+      "recvMs": 869,
+      "ttftMs": 694,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 10,
+      "send": "Name a color that starts with M.",
+      "recvText": "Magenta",
+      "recvMs": 875,
+      "ttftMs": 686,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 11,
+      "send": "How many letters in the word \"scaffolding\"?",
+      "recvText": "11",
+      "recvMs": 1718,
+      "ttftMs": 1683,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 12,
+      "send": "Is Tokyo north or south of the equator?",
+      "recvText": "North",
+      "recvMs": 996,
+      "ttftMs": 806,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 13,
+      "send": "What did I just ask before the Tokyo question?",
+      "recvText": "You asked: \"How many letters in the word 'scaffolding'?\"",
+      "recvMs": 991,
+      "ttftMs": 707,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 14,
+      "send": "Name a programming language that starts with \"P\".",
+      "recvText": "Python",
+      "recvMs": 1214,
+      "ttftMs": 1034,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 15,
+      "send": "Translate \"hello\" to Spanish.",
+      "recvText": "Hola",
+      "recvMs": 1047,
+      "ttftMs": 860,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 16,
+      "send": "How many sides does a hexagon have?",
+      "recvText": "6",
+      "recvMs": 962,
+      "ttftMs": 764,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 17,
+      "send": "What gas do plants release during photosynthesis?",
+      "recvText": "Oxygen",
+      "recvMs": 2670,
+      "ttftMs": 2338,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 18,
+      "send": "Pi rounded to two decimal places?",
+      "recvText": "3.14",
+      "recvMs": 6425,
+      "ttftMs": 6228,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 19,
+      "send": "How many rounds have we done so far? Estimate is fine.",
+      "recvText": "About 18 rounds.",
+      "recvMs": 2264,
+      "ttftMs": 2230,
+      "yieldExecId": ""
+    },
+    {
+      "idx": 20,
+      "send": "Final round. Reply with exactly \"DONE\" and yield.",
+      "recvText": "DONE",
+      "recvMs": 3555,
+      "ttftMs": 3355,
+      "yieldExecId": ""
+    }
+  ],
+  "failures": [],
+  "openAttempts": 33,
+  "streamOpenedAt": 1778710185382,
+  "wallMs": 50759,
+  "streamLifetimeMs": 31757,
+  "completedRounds": 20
+}

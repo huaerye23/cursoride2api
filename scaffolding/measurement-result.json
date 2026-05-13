@@ -1,0 +1,46 @@
+{
+  "model": "claude-opus-4-7-thinking-max",
+  "intervalMs": 300,
+  "timestamp": "2026-05-13T21:54:27.887Z",
+  "results": {
+    "h2": {
+      "n": 300,
+      "successes": 3,
+      "successRate": 0.01,
+      "ci95": [
+        0.0034065567627181124,
+        0.028984004635062833
+      ],
+      "counts": {
+        "unpaid_invoice": 297,
+        "success": 3
+      },
+      "latencyP50": {
+        "unpaid_invoice": 340,
+        "success": 2320
+      },
+      "latencyP95": {
+        "unpaid_invoice": 778,
+        "success": 3425
+      }
+    },
+    "h1": {
+      "n": 100,
+      "successes": 0,
+      "successRate": 0,
+      "ci95": [
+        0,
+        0.03699480747600191
+      ],
+      "counts": {
+        "elb_reject_464": 100
+      },
+      "latencyP50": {
+        "elb_reject_464": 76
+      },
+      "latencyP95": {
+        "elb_reject_464": 90
+      }
+    }
+  }
+}

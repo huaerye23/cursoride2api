@@ -1,0 +1,145 @@
+{
+  "model": "claude-opus-4-7-thinking-max-fast",
+  "openAttempts": 83,
+  "rounds": [
+    {
+      "idx": 1,
+      "sendMsg": "What's the current time? Call get_current_time, then give me a one-sentence answer with the time, then yield.",
+      "textBuf": "The current time is 2026-05-13T22:14:52 UTC.",
+      "elapsed": 4074,
+      "ttft": 3710,
+      "toolCalls": [
+        {
+          "toolName": "get_current_time",
+          "args": {},
+          "result": "2026-05-13T22:14:52.953Z"
+        }
+      ]
+    },
+    {
+      "idx": 2,
+      "sendMsg": "Now without using any tool, just tell me: what color is grass? One word.",
+      "textBuf": "Green.",
+      "elapsed": 929,
+      "ttft": 689,
+      "toolCalls": []
+    },
+    {
+      "idx": 3,
+      "sendMsg": "Compute (17 + 4) * 3 using the calculate tool, then state the result.",
+      "textBuf": "The result is 63.",
+      "elapsed": 5219,
+      "ttft": 5013,
+      "toolCalls": [
+        {
+          "toolName": "calculate",
+          "args": {
+            "expression": "(17 + 4) * 3"
+          },
+          "result": "63"
+        }
+      ]
+    },
+    {
+      "idx": 4,
+      "sendMsg": "Roll a random number between 1 and 100 using get_random_number, and tell me what you rolled.",
+      "textBuf": "I rolled 54.",
+      "elapsed": 1848,
+      "ttft": 1631,
+      "toolCalls": [
+        {
+          "toolName": "get_random_number",
+          "args": {
+            "min": 1,
+            "max": 100
+          },
+          "result": "54"
+        }
+      ]
+    },
+    {
+      "idx": 5,
+      "sendMsg": "Use get_current_time once, then use calculate to compute 8 * 7, then give a one-sentence summary.",
+      "textBuf": "At 2026-05-13T22:15:03 UTC, 8 * 7 equals 56.",
+      "elapsed": 2206,
+      "ttft": 1897,
+      "toolCalls": [
+        {
+          "toolName": "get_current_time",
+          "args": {},
+          "result": "2026-05-13T22:15:03.473Z"
+        },
+        {
+          "toolName": "calculate",
+          "args": {
+            "expression": "8 * 7"
+          },
+          "result": "56"
+        }
+      ]
+    },
+    {
+      "idx": 6,
+      "sendMsg": "What did I ask you in my very first request? Quote it briefly. No tools needed.",
+      "textBuf": "You asked for the current time via `get_current_time`, then a one-sentence answer with the time, then to yield.",
+      "elapsed": 1007,
+      "ttft": 648,
+      "toolCalls": []
+    },
+    {
+      "idx": 7,
+      "sendMsg": "How much is 2 + 2? Answer however you like.",
+      "textBuf": "4.",
+      "elapsed": 2930,
+      "ttft": 2895,
+      "toolCalls": []
+    },
+    {
+      "idx": 8,
+      "sendMsg": "Without calling any tool, what is the capital of Japan?",
+      "textBuf": "Tokyo.",
+      "elapsed": 1060,
+      "ttft": 728,
+      "toolCalls": []
+    },
+    {
+      "idx": 9,
+      "sendMsg": "Roll two random numbers, one between 1-10 and one between 50-60, then tell me both.",
+      "textBuf": "I rolled 2 (1-10) and 56 (50-60).",
+      "elapsed": 2138,
+      "ttft": 1902,
+      "toolCalls": [
+        {
+          "toolName": "get_random_number",
+          "args": {
+            "min": 1,
+            "max": 10
+          },
+          "result": "2"
+        },
+        {
+          "toolName": "get_random_number",
+          "args": {
+            "min": 50,
+            "max": 60
+          },
+          "result": "56"
+        }
+      ]
+    },
+    {
+      "idx": 10,
+      "sendMsg": "Final round. Reply with exactly \"DONE\" and yield. No tools.",
+      "textBuf": "DONE",
+      "elapsed": 895,
+      "ttft": 730,
+      "toolCalls": []
+    }
+  ],
+  "failures": [],
+  "streamOpenedAt": 1778710494596,
+  "wallMs": 67340,
+  "lifetimeMs": 18233,
+  "totalToolCalls": 7,
+  "roundsWithTools": 5
+}
