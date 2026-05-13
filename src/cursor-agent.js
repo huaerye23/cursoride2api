@@ -529,6 +529,9 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
 
   // ── requestContextArgs → respond with our tools + env ──
   if (msgCase === 'requestContextArgs') {
+    if (process.env.CURSOR_LOG_CONTEXT_ARGS === '1') {
+      console.log(`[cursor-agent] requestContextArgs received — sending ${mcpToolDefs.length} mcpToolDefs`);
+    }
     const requestContext = create(A.RequestContextSchema, {
       env: create(A.RequestContextEnvSchema, {
         osVersion: process.platform === 'win32' ? 'windows' : process.platform,

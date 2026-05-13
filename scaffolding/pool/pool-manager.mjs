@@ -38,9 +38,39 @@ const toolUseIndex = new Map();
 // Map requestId -> client socket (so we know where to stream events back)
 const requestClient = new Map();
 
-// (No pool-wide tool contract. Tools are sent per-request to the worker,
-// which calls bridge.setTools() before each round so Cursor picks them up
-// on the next requestContextArgs cycle.)
+// Empirical finding: Cursor only reads tools from requestContextResult ONCE
+// per stream (at the first requestContextArgs cycle, near stream open). So
+// tools must be set at worker open and CANNOT be updated mid-stream. The
+// first request's tools become the pool's contract; mismatched subsequent
+// requests trigger a full pool recycle.
+let poolTools = null;
+let poolSystem = null;
+let toolsSignature = '';
+
+function signatureOf(tools) {
+  if (!Array.isArray(tools)) return '';
+  return tools.filter((t) => t && t.name)
+    .map((t) => `${t.name}:${JSON.stringify(t.input_schema || t.jsonSchema || {})}`)
+    .sort().join('|');
+}
+
+function setPoolContract(system, tools) {
+  poolSystem = system || '';
+  poolTools = tools || [];
+  toolsSignature = signatureOf(tools);
+}
+
+function poolNeedsReopen(tools) {
+  return signatureOf(tools) !== toolsSignature;
+}
+
+function reopenAllChannels() {
+  log(`recycling all channels (new tools sig=[${toolsSignature.slice(0, 80)}])`);
+  for (const ch of channels.values()) {
+    try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
+  }
+  // exit handlers will respawn through maybeSpawnNext (sequentially).
+}
 
 // ── Channel management ──────────────────────────────────────────────────
 function spawnChannel() {
@@ -74,9 +104,12 @@ function spawnChannel() {
     log(`channel ${channelId} proc error:`, err.message);
   });
 
-  // Open immediately — workers register only bajie_yield at stream open;
-  // caller tools come in per-request via send_user_message.tools.
-  proc.send({ type: 'open', model: POOL_MODEL, tools: [], system: '' });
+  // If we already have a pool contract, open with those tools now. Otherwise
+  // the worker sits in `spawning` until the first client request bootstraps
+  // the contract.
+  if (poolTools !== null) {
+    proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+  }
   log(`spawned ${channelId} (pid=${proc.pid}); pool size=${channels.size}`);
   return ch;
 }
@@ -253,7 +286,6 @@ function routeRequest(job, ch) {
       type: 'send_user_message',
       requestId: job.requestId,
       text: job.payload.text,
-      tools: job.payload.tools,    // injected per-round via bridge.setTools()
     });
   } else if (job.action === 'send_tool_result') {
     ch.proc.send({
@@ -307,11 +339,30 @@ function handleClientMessage(client, msg) {
     const { requestId, action, text, content, anthropic_tool_use_id, system, tools } = msg;
 
     if (action === 'send_user_message') {
-      // Per-request tools — passed through to the worker, which calls
-      // bridge.setTools() before sending the user message. No pool-wide
-      // tool contract; channels are fungible across any tool list.
+      // First request bootstraps the pool's tool contract; subsequent
+      // requests with a different tool list trigger a full recycle.
+      if (poolTools === null) {
+        setPoolContract(system, tools || []);
+        log(`pool contract set: tools=${(tools || []).length} system=${(system || '').slice(0, 60)}`);
+        // Send `open` to any worker still in `spawning` (waiting for tools).
+        for (const ch of channels.values()) {
+          if (ch.state === 'spawning') {
+            ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+          }
+        }
+      } else if (poolNeedsReopen(tools || [])) {
+        log(`tools mismatch — recycling pool`);
+        setPoolContract(system, tools || []);
+        reopenAllChannels();
+        writeToClient(client, {
+          type: 'error', requestId,
+          message: 'pool recycling for new tools contract — retry in 30-180s',
+        });
+        return;
+      }
+
       const ch = pickReadyChannel();
-      const payload = { text, tools: tools || [] };
+      const payload = { text };
       if (ch) {
         routeRequest({ requestId, action, payload, client }, ch);
       } else {
@@ -439,6 +490,8 @@ function statusSnapshot() {
       model: POOL_MODEL,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
+      poolToolsContractCount: poolTools ? poolTools.length : null,
+      poolToolsSignature: toolsSignature.slice(0, 80),
     },
   };
 }

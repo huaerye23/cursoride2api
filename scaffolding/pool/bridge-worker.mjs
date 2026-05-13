@@ -64,22 +64,26 @@ function buildYieldTool() {
   };
 }
 
-function buildPrimingPrompt(system) {
-  // Open with NO caller tools registered. Caller tools (Read, Bash, Edit,
-  // whatever the API client supplies) get injected per-round via
-  // bridge.setTools() — Cursor's protocol re-reads tools on every
-  // requestContextArgs cycle so the model sees the current set each turn.
-  // The priming below explicitly warns the model that the tool list will
-  // change so it doesn't ignore tools that appear later.
-  return [
-    'You are operating in RELAY mode behind a proxy. Each user message will be delivered via the `bajie_yield` tool result.',
-    'Your tool list may change between turns: the proxy injects whatever tools the upstream client (e.g. claude-code, an Anthropic SDK caller) declared on each request. When you see a tool in your available-tools list, you may call it naturally — even if it was not present in earlier turns. When a tool is no longer listed, do not try to call it.',
-    `At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`,
-    'The bajie_yield tool result is the next user message verbatim.',
-    'Never end your turn without calling bajie_yield. Never produce text outside of a normal response.',
-    system ? `Caller system context (may be updated by future rounds):\n---\n${typeof system === 'string' ? system : JSON.stringify(system)}\n---` : '',
-    'Reply with exactly "READY" to acknowledge, then call bajie_yield.',
-  ].filter(Boolean).join('\n\n');
+function buildPrimingPrompt(system, callerTools) {
+  // Cursor only reads tools from requestContextResult ONCE per stream
+  // (empirically verified). So tools must be set at open time; the pool
+  // manager recycles all channels when a request arrives with a different
+  // tool list.
+  const lines = ['You are operating in RELAY mode behind a proxy. Each user message will be delivered via the `bajie_yield` tool result.'];
+  if (callerTools && callerTools.length > 0) {
+    lines.push(`Available tools: ${callerTools.map((t) => t.name).join(', ')}, and ${YIELD_TOOL_NAME}.`);
+    lines.push('Use caller tools when the task requires them. Skip them when not needed.');
+  } else {
+    lines.push(`The only tool you have is ${YIELD_TOOL_NAME}.`);
+  }
+  lines.push(`At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`);
+  lines.push('The bajie_yield tool result is the next user message verbatim.');
+  lines.push('Never end your turn without calling bajie_yield. Never produce text outside of a normal response.');
+  if (system) {
+    lines.push(`Caller system context:\n---\n${typeof system === 'string' ? system : JSON.stringify(system)}\n---`);
+  }
+  lines.push('Reply with exactly "READY" to acknowledge, then call bajie_yield.');
+  return lines.join('\n\n');
 }
 
 // ── Open with retry ──────────────────────────────────────────────────────
@@ -116,12 +120,17 @@ function openOnce(initialPrompt, allTools) {
   });
 }
 
-async function openWithRetry(system) {
-  // Open with ONLY bajie_yield. Caller tools are injected per-request via
-  // bridge.setTools() — see handleMessage('send_user_message').
+async function openWithRetry(system, callerTools) {
   const yieldTool = buildYieldTool();
-  const allTools = [yieldTool];
-  const primingPrompt = buildPrimingPrompt(system);
+  const cTools = (callerTools || []).map((t) => ({
+    name: t.name,
+    toolName: t.name,
+    description: t.description || '',
+    providerIdentifier: 'cursoride2api-ratlc-pool',
+    jsonSchema: t.input_schema || t.jsonSchema || { type: 'object', properties: {}, required: [] },
+  }));
+  const allTools = [yieldTool, ...cTools];
+  const primingPrompt = buildPrimingPrompt(system, cTools);
 
   setState('opening');
   let rateLimitBackoff = 5000;
@@ -216,7 +225,7 @@ function attachLiveCallbacks() {
 async function handleMessage(msg) {
   if (msg.type === 'open') {
     try {
-      await openWithRetry(msg.system || '');
+      await openWithRetry(msg.system || '', msg.tools || []);
     } catch (e) {
       setState('dead', { error: e.message });
       process.exit(1);
@@ -228,13 +237,6 @@ async function handleMessage(msg) {
     if (!pendingYield) {
       send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId, message: 'no_pending_yield (state=' + currentState + ')' });
       return;
-    }
-    // Update tool list before sending — Cursor reads tools from
-    // requestContextResult on each round's requestContextArgs cycle, so a
-    // setTools() call here makes the next round's tools current.
-    if (msg.tools && Array.isArray(msg.tools)) {
-      try { bridge.setTools(msg.tools); }
-      catch (e) { send({ type: 'log', level: 'warn', message: 'setTools failed: ' + e.message }); }
     }
     currentRequestId = msg.requestId;
     setState('busy');
