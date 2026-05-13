@@ -1717,10 +1717,20 @@ function startConversation(token, options = {}) {
     }).catch((e) => fail(`proto load failed: ${e.message}`));
   }
 
+  // Replace the bridge's tool registry mid-stream. Used by the RATLC pool
+  // worker so a single long-lived stream can serve requests with different
+  // caller tool lists — Cursor re-reads tools from requestContextResult on
+  // each round's requestContextArgs cycle, so updating state.mcpToolDefs
+  // here makes the next round's tool list current.
+  function setTools(newTools) {
+    state.mcpToolDefs = buildMcpToolDefinitions(newTools || []);
+  }
+
   return {
     conversationId,
     sendToolResult,
     setCallbacks,
+    setTools,
     close,
     // Latest known token counts. server.js's finalizeToolUseTurn fires
     // before onTurnEnded, but conversationCheckpointUpdate frames may have

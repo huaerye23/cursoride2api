@@ -63,7 +63,7 @@ function printStatus(snapshot) {
   const { pool, config } = snapshot;
   const counts = `ready=${pool.readyCount} busy=${pool.busyCount} opening=${pool.openingCount} dead=${pool.deadCount}`;
   console.log(`Pool: ${pool.actualSize}/${pool.configuredSize} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
-  console.log(`Model: ${config.model}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min  tool_contract=${config.poolToolsContractCount}`);
+  console.log(`Model: ${config.model}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min  (tools: per-request)`);
   console.log('');
   if (!pool.channels || pool.channels.length === 0) {
     console.log('  (no channels)');

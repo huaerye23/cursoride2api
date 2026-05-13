@@ -38,11 +38,9 @@ const toolUseIndex = new Map();
 // Map requestId -> client socket (so we know where to stream events back)
 const requestClient = new Map();
 
-// First request's tools become the pool's contract; subsequent requests with
-// different tools trigger a full pool restart (MVP behavior).
-let poolTools = null;
-let poolSystem = null;
-let toolsSignature = '';
+// (No pool-wide tool contract. Tools are sent per-request to the worker,
+// which calls bridge.setTools() before each round so Cursor picks them up
+// on the next requestContextArgs cycle.)
 
 // ── Channel management ──────────────────────────────────────────────────
 function spawnChannel() {
@@ -76,8 +74,9 @@ function spawnChannel() {
     log(`channel ${channelId} proc error:`, err.message);
   });
 
-  // Send `open` once we have a tools contract (or open with [] if first).
-  proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools || [], system: poolSystem || '' });
+  // Open immediately — workers register only bajie_yield at stream open;
+  // caller tools come in per-request via send_user_message.tools.
+  proc.send({ type: 'open', model: POOL_MODEL, tools: [], system: '' });
   log(`spawned ${channelId} (pid=${proc.pid}); pool size=${channels.size}`);
   return ch;
 }
@@ -250,7 +249,12 @@ function routeRequest(job, ch) {
   ch.lastActivityAt = Date.now();
   requestClient.set(job.requestId, job.client);
   if (job.action === 'send_user_message') {
-    ch.proc.send({ type: 'send_user_message', requestId: job.requestId, text: job.payload.text });
+    ch.proc.send({
+      type: 'send_user_message',
+      requestId: job.requestId,
+      text: job.payload.text,
+      tools: job.payload.tools,    // injected per-round via bridge.setTools()
+    });
   } else if (job.action === 'send_tool_result') {
     ch.proc.send({
       type: 'send_tool_result',
@@ -262,34 +266,6 @@ function routeRequest(job, ch) {
     writeToClient(job.client, { type: 'error', requestId: job.requestId, message: 'unknown action: ' + job.action });
     return;
   }
-}
-
-// ── Tools-signature comparison + pool reopen ─────────────────────────────
-function signatureOf(tools) {
-  if (!Array.isArray(tools)) return '';
-  return tools
-    .filter((t) => t && t.name)
-    .map((t) => `${t.name}:${JSON.stringify(t.input_schema || t.jsonSchema || {})}`)
-    .sort()
-    .join('|');
-}
-
-function setPoolContract(system, tools) {
-  poolSystem = system || '';
-  poolTools = tools || [];
-  toolsSignature = signatureOf(tools);
-}
-
-function poolNeedsReopen(system, tools) {
-  return signatureOf(tools) !== toolsSignature;
-}
-
-function reopenAllChannels() {
-  log(`reopening all channels with new tools sig=[${toolsSignature.slice(0, 80)}]`);
-  for (const ch of channels.values()) {
-    try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
-  }
-  // Workers will exit; respawn loop in handleWorkerExit will recreate them.
 }
 
 // ── Idle ping ────────────────────────────────────────────────────────────
@@ -331,35 +307,16 @@ function handleClientMessage(client, msg) {
     const { requestId, action, text, content, anthropic_tool_use_id, system, tools } = msg;
 
     if (action === 'send_user_message') {
-      // First request bootstraps the pool tools contract.
-      if (poolTools === null) {
-        setPoolContract(system, tools || []);
-        log(`pool contract set: tools=${(tools || []).length}, system=${(system || '').slice(0, 60)}`);
-        // Send `open` to any workers that haven't been told their tools yet.
-        for (const ch of channels.values()) {
-          if (ch.state === 'spawning') {
-            ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
-          }
-        }
-      } else if (poolNeedsReopen(system, tools || [])) {
-        // Tools changed — reset contract and recycle all channels.
-        log(`tools mismatch — recycling pool`);
-        setPoolContract(system, tools || []);
-        reopenAllChannels();
-        writeToClient(client, {
-          type: 'error',
-          requestId,
-          message: 'pool recycling for new tools contract — retry shortly',
-        });
-        return;
-      }
-
+      // Per-request tools — passed through to the worker, which calls
+      // bridge.setTools() before sending the user message. No pool-wide
+      // tool contract; channels are fungible across any tool list.
       const ch = pickReadyChannel();
+      const payload = { text, tools: tools || [] };
       if (ch) {
-        routeRequest({ requestId, action, payload: { text }, client }, ch);
+        routeRequest({ requestId, action, payload, client }, ch);
       } else {
         log(`no ready channel — queuing requestId=${requestId} (queue depth ${requestQueue.length + 1})`);
-        requestQueue.push({ requestId, action, payload: { text }, client });
+        requestQueue.push({ requestId, action, payload, client });
       }
       return;
     }
@@ -482,8 +439,6 @@ function statusSnapshot() {
       model: POOL_MODEL,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
-      poolToolsContractCount: poolTools ? poolTools.length : null,
-      poolToolsSignature: toolsSignature.slice(0, 80),
     },
   };
 }
