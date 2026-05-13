@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { defaultTranslateModeTools } from './tool-translator.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,7 +21,13 @@ const POOL_MODEL = process.env.POOL_MODEL || 'claude-opus-4-7-thinking-max-fast'
 const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);  // 20 min
 const PING_TIMEOUT_MS = parseInt(process.env.PING_TIMEOUT_MS || '45000', 10);
 const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10); // wait between worker spawns
+const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
 const WORKER_SCRIPT = path.join(__dirname, 'bridge-worker.mjs');
+
+if (!['contract', 'translate'].includes(POOL_TOOL_MODE)) {
+  console.error(`invalid POOL_TOOL_MODE=${POOL_TOOL_MODE} (must be contract|translate)`);
+  process.exit(1);
+}
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [pool]`, ...args);
 
@@ -40,12 +47,26 @@ const requestClient = new Map();
 
 // Empirical finding: Cursor only reads tools from requestContextResult ONCE
 // per stream (at the first requestContextArgs cycle, near stream open). So
-// tools must be set at worker open and CANNOT be updated mid-stream. The
-// first request's tools become the pool's contract; mismatched subsequent
-// requests trigger a full pool recycle.
+// tools must be set at worker open and CANNOT be updated mid-stream.
+//
+// Two modes:
+//   contract  — first client request's tools become the pool's tool list;
+//               subsequent mismatched requests trigger a full recycle.
+//               Workers stay 'spawning' until first request bootstraps.
+//   translate — workers open immediately with a tiny placeholder tool list
+//               that triggers Cursor to inject its full default toolset
+//               (Shell/Read/Write/Grep/Glob/StrReplace/...). Caller-side
+//               tool names are mapped via tool-translator.mjs. No recycle.
 let poolTools = null;
 let poolSystem = null;
 let toolsSignature = '';
+
+if (POOL_TOOL_MODE === 'translate') {
+  // Pre-set the contract so spawn() opens immediately with translate-mode tools.
+  poolTools = defaultTranslateModeTools();
+  poolSystem = '';
+  toolsSignature = 'translate-mode-static';
+}
 
 function signatureOf(tools) {
   if (!Array.isArray(tools)) return '';
@@ -339,27 +360,32 @@ function handleClientMessage(client, msg) {
     const { requestId, action, text, content, anthropic_tool_use_id, system, tools } = msg;
 
     if (action === 'send_user_message') {
-      // First request bootstraps the pool's tool contract; subsequent
-      // requests with a different tool list trigger a full recycle.
-      if (poolTools === null) {
-        setPoolContract(system, tools || []);
-        log(`pool contract set: tools=${(tools || []).length} system=${(system || '').slice(0, 60)}`);
-        // Send `open` to any worker still in `spawning` (waiting for tools).
-        for (const ch of channels.values()) {
-          if (ch.state === 'spawning') {
-            ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+      // Tool list bootstrap / recycle logic only runs in CONTRACT mode.
+      // In TRANSLATE mode the pool always opens with a fixed placeholder
+      // tool list (which triggers Cursor's default toolset to be injected
+      // into the model's prompt); caller tools are translated on the wire.
+      if (POOL_TOOL_MODE === 'contract') {
+        if (poolTools === null) {
+          setPoolContract(system, tools || []);
+          log(`pool contract set: tools=${(tools || []).length} system=${(system || '').slice(0, 60)}`);
+          for (const ch of channels.values()) {
+            if (ch.state === 'spawning') {
+              ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+            }
           }
+        } else if (poolNeedsReopen(tools || [])) {
+          log(`tools mismatch — recycling pool`);
+          setPoolContract(system, tools || []);
+          reopenAllChannels();
+          writeToClient(client, {
+            type: 'error', requestId,
+            message: 'pool recycling for new tools contract — retry in 30-180s',
+          });
+          return;
         }
-      } else if (poolNeedsReopen(tools || [])) {
-        log(`tools mismatch — recycling pool`);
-        setPoolContract(system, tools || []);
-        reopenAllChannels();
-        writeToClient(client, {
-          type: 'error', requestId,
-          message: 'pool recycling for new tools contract — retry in 30-180s',
-        });
-        return;
       }
+      // TRANSLATE mode: pool is pre-warmed with placeholder tools, nothing
+      // to bootstrap or recycle.
 
       const ch = pickReadyChannel();
       const payload = { text };
@@ -488,6 +514,7 @@ function statusSnapshot() {
     },
     config: {
       model: POOL_MODEL,
+      toolMode: POOL_TOOL_MODE,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
       poolToolsContractCount: poolTools ? poolTools.length : null,

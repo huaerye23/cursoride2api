@@ -63,7 +63,11 @@ function printStatus(snapshot) {
   const { pool, config } = snapshot;
   const counts = `ready=${pool.readyCount} busy=${pool.busyCount} opening=${pool.openingCount} dead=${pool.deadCount}`;
   console.log(`Pool: ${pool.actualSize}/${pool.configuredSize} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
-  console.log(`Model: ${config.model}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min  contract=${config.poolToolsContractCount === null ? 'unset' : config.poolToolsContractCount + ' tools'}`);
+  const modeStr = `mode=${config.toolMode || 'contract'}`;
+  const contractStr = config.toolMode === 'translate'
+    ? 'translate (Cursor defaults)'
+    : (config.poolToolsContractCount === null ? 'unset' : `${config.poolToolsContractCount} tools`);
+  console.log(`Model: ${config.model}  ${modeStr}  contract=${contractStr}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min`);
   console.log('');
   if (!pool.channels || pool.channels.length === 0) {
     console.log('  (no channels)');

@@ -8,10 +8,12 @@
 import http from 'node:http';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
+import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
 
 const PORT = parseInt(process.env.PORT || '4242', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
+const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
 
@@ -214,7 +216,33 @@ async function handleMessagesRequest(req, res) {
       if (msg.type === 'text_delta') {
         emitTextDelta(msg.text);
       } else if (msg.type === 'tool_use') {
-        emitToolUseBlock(msg.anthropic_id, msg.name, msg.args);
+        // In contract mode, names are passed through unchanged.
+        // In translate mode, the model emitted a Cursor name (e.g. Shell);
+        // we map to the Anthropic name (Bash) and adapt args. If the
+        // Cursor tool has no Anthropic equivalent, we silently reject
+        // back to the inner agent by sending a tool_error result via
+        // the pool socket — the agent picks a different approach.
+        if (POOL_TOOL_MODE === 'translate' && !isInternalTool(msg.name)) {
+          const xlated = cursorToAnthropic(msg.name, msg.args || {});
+          if (!xlated.ok) {
+            // Rejection — feed the error back through the pool to the inner
+            // agent. The api-server's request stream stays open; the inner
+            // agent will keep generating after seeing this tool_result.
+            poolWrite({
+              type: 'request',
+              requestId: requestId + ':auto_reject',
+              action: 'send_tool_result',
+              anthropic_tool_use_id: msg.anthropic_id,
+              content: `[proxy_error] ${xlated.error}`,
+            });
+            // Don't emit anything to the client — pretend the tool_use
+            // never happened from claude-code's POV.
+            return;
+          }
+          emitToolUseBlock(msg.anthropic_id, xlated.name, xlated.input);
+        } else {
+          emitToolUseBlock(msg.anthropic_id, msg.name, msg.args);
+        }
         stopReason = 'tool_use';
         finishMessage();
       } else if (msg.type === 'yield') {
