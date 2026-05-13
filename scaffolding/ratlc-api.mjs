@@ -248,9 +248,37 @@ function openOnce(initialPrompt, tools) {
   });
 }
 
+// Compare requested tool list to the bridge's current tools — if they
+// differ, the bridge needs to be closed and re-opened so the new tools
+// are visible to the inner Cursor agent. Same names + same schemas = no
+// re-open. Name-only mismatch (e.g., one extra tool) = re-open.
+function toolsSignature(toolList) {
+  if (!Array.isArray(toolList)) return '';
+  return toolList
+    .filter((t) => t && t.name)
+    .map((t) => `${t.name}:${JSON.stringify(t.input_schema || t.jsonSchema || {})}`)
+    .sort()
+    .join('|');
+}
+
+let currentToolSig = '';
+
 async function ensureBridge(system, tools) {
-  if (bridgeReady) return;
+  const incomingSig = toolsSignature(tools || []);
+  if (bridgeReady && incomingSig === currentToolSig) return;
+  if (bridgeReady && incomingSig !== currentToolSig) {
+    log(`tools changed (was=[${currentToolSig.slice(0, 80)}] now=[${incomingSig.slice(0, 80)}]) — closing bridge to re-open`);
+    try { bridge.close(); } catch { /* ignore */ }
+    bridge = null;
+    bridgeReady = false;
+    pendingYield = null;
+    pendingToolUseInfo = null;
+    callerToolDefs = [];
+    openingPromise = null;
+    openAttempts = 0;
+  }
   if (openingPromise) return openingPromise;
+  currentToolSig = incomingSig;
   openingPromise = (async () => {
     log(`opening RATLC stream (model=${MODEL}, tools=${tools.length}, retry up to ${OPEN_RETRY_MAX})...`);
     const yieldTool = buildYieldTool();
