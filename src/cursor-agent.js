@@ -569,12 +569,16 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'backgroundShell-passthrough';
     }
     if (msgCase === 'readArgs') {
-      nativeExecKinds.set(execId, 'read');
+      // Preserve the path so we can echo it back in ReadSuccess.path when
+      // the caller's tool_result arrives. Cursor's UI/model uses .path
+      // when displaying the read result; an empty path was making the
+      // model emit "Unknown output type" follow-ups.
+      nativeExecKinds.set(execId, { kind: 'read', path: msgValue?.path || '' });
       onMcpCall({ id, execId, toolCallId: `native-read-${execId.slice(0, 8)}`, toolName: 'Read', args: { file_path: msgValue?.path || '' } });
       return 'read-passthrough';
     }
     if (msgCase === 'writeArgs') {
-      nativeExecKinds.set(execId, 'write');
+      nativeExecKinds.set(execId, { kind: 'write', path: msgValue?.path || '' });
       onMcpCall({
         id, execId,
         toolCallId: `native-write-${execId.slice(0, 8)}`,
@@ -584,7 +588,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'write-passthrough';
     }
     if (msgCase === 'fetchArgs') {
-      nativeExecKinds.set(execId, 'fetch');
+      nativeExecKinds.set(execId, { kind: 'fetch', url: msgValue?.url || '' });
       onMcpCall({
         id, execId,
         toolCallId: `native-fetch-${execId.slice(0, 8)}`,
@@ -1236,9 +1240,16 @@ function startConversation(token, options = {}) {
     // If this execId was for a native tool call (shellArgs/readArgs/etc.) that
     // we routed through onMcpCall instead of rejecting, build the matching
     // native result type rather than McpResult.
-    const nativeKind = _nativeExecKinds.get(execId);
-    if (nativeKind) {
+    const nativeKindRaw = _nativeExecKinds.get(execId);
+    if (nativeKindRaw) {
       _nativeExecKinds.delete(execId);
+      // nativeKindRaw may be either a string (legacy form for shell/grep/...)
+      // or an object {kind, path?, url?} (newer form that preserves the
+      // original tool args so we can echo them back in the result and avoid
+      // the model getting confused by empty .path fields).
+      const nativeKind = typeof nativeKindRaw === 'string' ? nativeKindRaw : nativeKindRaw.kind;
+      const nativePath = typeof nativeKindRaw === 'string' ? '' : (nativeKindRaw.path || '');
+      const nativeUrl = typeof nativeKindRaw === 'string' ? '' : (nativeKindRaw.url || '');
       // Extract a single string from the caller's tool_result content.
       let text;
       if (typeof content === 'string') text = content;
@@ -1310,7 +1321,7 @@ function startConversation(token, options = {}) {
           result: {
             case: 'success',
             value: create(agent.ReadSuccessSchema, {
-              path: '', content: text,
+              path: nativePath, content: text,
               totalLines: text.split('\n').length, fileSize: BigInt(Buffer.byteLength(text)),
               truncated: false,
             }),
@@ -1324,7 +1335,7 @@ function startConversation(token, options = {}) {
           result: {
             case: 'success',
             value: create(agent.WriteSuccessSchema, {
-              path: '', linesCreated: text.split('\n').length, fileSize: Buffer.byteLength(text),
+              path: nativePath, linesCreated: text.split('\n').length, fileSize: Buffer.byteLength(text),
               fileContentAfterWrite: '',
             }),
           },
@@ -1337,7 +1348,7 @@ function startConversation(token, options = {}) {
           result: {
             case: 'success',
             value: create(agent.FetchSuccessSchema, {
-              url: '', content: text,
+              url: nativeUrl, content: text,
               statusCode: 200, contentType: 'text/plain',
             }),
           },

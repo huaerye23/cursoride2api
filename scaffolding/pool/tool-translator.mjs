@@ -161,8 +161,20 @@ export function anthropicResultToCursor(anthropicName, content) {
 // one non-trivial-looking tool via mcpToolDefs. Tools whose names start
 // with our internal `bajie_` prefix don't seem to trigger the injection
 // (Cursor likely treats them as internal). Tools with empty schemas may
-// also be skipped. We register a tool with a generic, non-internal-looking
-// name and a real schema property so Cursor's injection logic kicks in.
+// also be skipped.
+//
+// We register Edit/Glob/NotebookEdit/TodoWrite under their Anthropic
+// (claude-code) names directly so when the caller asks for `Edit`/`Glob`
+// the model has a *matching* tool in its prompt with the EXACT schema
+// claude-code documents. This avoids the model falling back to Cursor's
+// `StrReplace`/Cursor-`Glob` (whose arg names differ — `path` vs
+// `file_path`, etc.) and saying "X unavailable" when it can't reconcile
+// schemas. Each tool whose name conflicts with a Cursor built-in gets the
+// `mcp_` prefix on the wire (see cursor-agent.js CURSOR_NATIVE_TOOL_NAMES);
+// the `toolName` field stays unprefixed so mcpArgs round-trips cleanly.
+//
+// search_codebase is kept as the placeholder that proves "tools.length>0"
+// to Cursor's default-toolset injector.
 export function defaultTranslateModeTools() {
   return [
     {
@@ -176,10 +188,89 @@ export function defaultTranslateModeTools() {
         required: ['query'],
       },
     },
+    // Anthropic `Edit` — alias for Cursor's `StrReplace` but with the exact
+    // schema claude-code emits. Receives via mcpArgs(toolName="Edit").
+    {
+      name: 'Edit',
+      description:
+        'Find-and-replace edit on a file. Required: file_path, old_string, new_string. ' +
+        'old_string must match exactly (including indentation). Set replace_all=true to ' +
+        'replace every occurrence. The new_string must differ from old_string.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string', description: 'Absolute path to the file to modify.' },
+          old_string: { type: 'string', description: 'Text to find. Must match exactly.' },
+          new_string: { type: 'string', description: 'Replacement text. Must differ from old_string.' },
+          replace_all: { type: 'boolean', description: 'Replace all occurrences (default false).' },
+        },
+        required: ['file_path', 'old_string', 'new_string'],
+      },
+    },
+    // Anthropic `Glob` — file-pattern search.
+    {
+      name: 'Glob',
+      description: 'Find files by glob pattern (e.g. "**/*.ts"). Returns matching paths sorted by modification time.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'The glob pattern to match against file paths.' },
+          path: { type: 'string', description: 'Optional directory to search in (defaults to cwd).' },
+        },
+        required: ['pattern'],
+      },
+    },
+    // Anthropic `NotebookEdit` — Cursor calls this `EditNotebook` natively;
+    // by registering the Anthropic name we let claude-code's calls land
+    // through mcpArgs directly without name translation.
+    {
+      name: 'NotebookEdit',
+      description: 'Edit a Jupyter notebook cell. Args mirror claude-code: notebook_path, new_source, optional cell_id, cell_type, edit_mode.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          notebook_path: { type: 'string', description: 'Absolute path to the .ipynb file.' },
+          cell_id: { type: 'string', description: 'ID of the cell to edit (optional for insert).' },
+          new_source: { type: 'string', description: 'New cell source text.' },
+          edit_mode: { type: 'string', enum: ['replace', 'insert', 'delete'], description: 'Edit mode (default replace).' },
+          cell_type: { type: 'string', enum: ['code', 'markdown'], description: 'Cell type for insert mode.' },
+        },
+        required: ['notebook_path', 'new_source'],
+      },
+    },
+    // Anthropic `TodoWrite` — a popular built-in in claude-code workflows.
+    // Cursor also has `TodoWrite` natively but its arg shape differs.
+    {
+      name: 'TodoWrite',
+      description: 'Write or update the todo list for the current session. Pass an array of {subject, description, activeForm?} objects.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          todos: {
+            type: 'array',
+            description: 'Array of todo items.',
+            items: {
+              type: 'object',
+              properties: {
+                subject: { type: 'string' },
+                description: { type: 'string' },
+                activeForm: { type: 'string' },
+                status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+              },
+              required: ['subject'],
+            },
+          },
+        },
+        required: ['todos'],
+      },
+    },
   ];
 }
 
 // Names the model should never directly invoke (proxy-internal).
+// `search_codebase` is internal scaffolding; `bajie_yield` is the relay
+// signal. Edit/Glob/NotebookEdit/TodoWrite are registered as MCP tools
+// (above) and DO bubble up to the client when called — they aren't internal.
 export function isInternalTool(name) {
   return name === 'bajie_yield' || name === 'search_codebase';
 }

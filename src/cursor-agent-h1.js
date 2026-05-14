@@ -394,10 +394,15 @@ function startConversation(token, options = {}) {
       return out;
     }
 
-    // Native passthrough dispatch
-    const nativeKind = _nativeExecKinds.get(execId);
-    if (nativeKind) {
+    // Native passthrough dispatch — mirrors src/cursor-agent.js. nativeKindRaw
+    // can be either a string (legacy) or {kind, path?, url?} so we can echo
+    // back the original tool args (path/url) instead of an empty string.
+    const nativeKindRaw = _nativeExecKinds.get(execId);
+    if (nativeKindRaw) {
       _nativeExecKinds.delete(execId);
+      const nativeKind = typeof nativeKindRaw === 'string' ? nativeKindRaw : nativeKindRaw.kind;
+      const nativePath = typeof nativeKindRaw === 'string' ? '' : (nativeKindRaw.path || '');
+      const nativeUrl = typeof nativeKindRaw === 'string' ? '' : (nativeKindRaw.url || '');
       let text;
       if (typeof content === 'string') text = content;
       else if (content && Array.isArray(content.items)) {
@@ -460,7 +465,7 @@ function startConversation(token, options = {}) {
           result: {
             case: 'success',
             value: create(agent.ReadSuccessSchema, {
-              path: '', content: text,
+              path: nativePath, content: text,
               totalLines: text.split('\n').length, fileSize: BigInt(Buffer.byteLength(text)),
               truncated: false,
             }),
@@ -474,7 +479,7 @@ function startConversation(token, options = {}) {
           result: {
             case: 'success',
             value: create(agent.WriteSuccessSchema, {
-              path: '', linesCreated: text.split('\n').length, fileSize: Buffer.byteLength(text),
+              path: nativePath, linesCreated: text.split('\n').length, fileSize: Buffer.byteLength(text),
               fileContentAfterWrite: '',
             }),
           },
@@ -487,7 +492,7 @@ function startConversation(token, options = {}) {
           result: {
             case: 'success',
             value: create(agent.FetchSuccessSchema, {
-              url: '', content: text,
+              url: nativeUrl, content: text,
               statusCode: 200, contentType: 'text/plain',
             }),
           },
