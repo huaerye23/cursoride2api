@@ -88,19 +88,52 @@ Wire format: newline-delimited JSON. One line = one message.
 // For new conversation turn:
 { "type": "request", "requestId": "req-abc",
   "action": "send_user_message", "text": "...",
-  "system": "<caller system>", "tools": [...] }   // first request's tools become the pool's tools
+  "system": "<caller system>", "tools": [...],   // first request's tools become the pool's tools
+  "model": "claude-haiku-4-5-fast"               // optional — names the target group;
+                                                  // omitted/unknown → default group
+}
 
 // For tool_result follow-up:
 { "type": "request", "requestId": "req-abc",
   "action": "send_tool_result",
   "anthropic_tool_use_id": "toolu_xyz", "content": "..." }
 
-// Snapshot pool state.
+// For N parallel tool_results from a single assistant turn:
+{ "type": "request", "requestId": "req-abc",
+  "action": "send_tool_results",
+  "model": "claude-haiku-4-5-fast",              // optional — informational; routing is
+                                                  // forced to the channel that emitted
+                                                  // the matching tool_use
+  "results": [
+    { "anthropic_tool_use_id": "toolu_aaa", "content": "..." },
+    { "anthropic_tool_use_id": "toolu_bbb", "content": "..." }
+  ]
+}
+
+// Snapshot pool state. Response includes pool.groups[] and per-channel group field.
 { "type": "status" }
 
-// Scale pool.
-{ "type": "ramp_up", "count": 3 }
-{ "type": "ramp_down", "count": 2 }
+// List groups only (lighter snapshot).
+{ "type": "list_groups" }
+// → { "type": "groups", "groups": [{ model, isDefault, draining, target, actual,
+//                                    ready, busy, opening, dead, rounds }, ...] }
+
+// Register a new model group (or resize an existing one).
+{ "type": "add_group", "model": "claude-haiku-4-5-fast", "size": 3 }
+// → { "type": "ack", "message": "group <m> added (target=3)" }
+//   or { "type": "error", "message": "..." } if model missing / already draining
+
+// Drain a non-default group: refuses new dispatches, lets in-flight finish,
+// kills channels once idle, removes the group entry when channel count hits 0.
+// Refused on the default group.
+{ "type": "remove_group", "model": "claude-haiku-4-5-fast" }
+// → { "type": "ack", "message": "group <m> draining (N channels to evict)" }
+//   or { "type": "error", "message": "cannot remove default group" }
+
+// Scale a single group (defaults to default group).
+{ "type": "ramp_up",   "count": 3, "group": "claude-haiku-4-5-fast" }
+{ "type": "ramp_down", "count": 2, "group": "claude-haiku-4-5-fast" }
+// group field is optional; omitted = POOL_MODEL.
 
 // Force-restart a specific channel.
 { "type": "restart_channel", "channelId": "ch-3" }
@@ -112,6 +145,16 @@ Wire format: newline-delimited JSON. One line = one message.
 ### Manager → Client — streamed events on a request
 
 ```jsonc
+// First event after request acceptance: tells the client which channel +
+// group the request was routed to. api-server uses this to stamp the
+// x-ratlc-* response headers BEFORE writing the SSE preamble.
+{ "type": "route_decision", "requestId": "req-abc",
+  "channelId": "ch-7", "servedModel": "claude-haiku-4-5-fast",
+  "requestedModel": "claude-haiku-4-5-fast",     // what the client asked for
+  "fallback": false,                              // true when servedModel ≠ requestedModel
+  "fallbackReason": null                          // "unknown-model" | "group-draining" | "group-no-ready"
+}
+
 // Routed to whichever channel won the request.
 { "type": "text_delta", "requestId": "req-abc", "text": "Hello" }
 
@@ -132,27 +175,44 @@ Wire format: newline-delimited JSON. One line = one message.
 {
   "type": "status",
   "pool": {
-    "configuredSize": 5,
+    "configuredSize": 5,                 // sum of all groups' targetSize
     "channels": [
-      { "id": "ch-0", "state": "ready",   "openedAt": ...,
-        "openAttempts": 87, "lastActivityAt": ..., "idleMs": 240000,
+      { "id": "ch-0", "state": "ready",  "group": "claude-opus-4-7-thinking-max-fast",
+        "openedAt": ..., "openAttempts": 87, "lastActivityAt": ..., "idleMs": 240000,
         "roundsServed": 14, "pid": 12345 },
-      { "id": "ch-1", "state": "opening", "openAttempts": 123, "pid": 12346 },
-      { "id": "ch-2", "state": "busy",    "currentRequestId": "req-abc",
+      { "id": "ch-1", "state": "opening", "group": "claude-haiku-4-5-fast",
+        "openAttempts": 123, "pid": 12346 },
+      { "id": "ch-2", "state": "busy",   "group": "claude-haiku-4-5-fast",
+        "currentRequestId": "req-abc",
         "openAttempts": 92, "pid": 12347, "roundsServed": 7 },
-      ...
+      // ...
     ],
-    "readyCount": 3,
-    "busyCount": 1,
-    "openingCount": 1,
-    "deadCount": 0,
-    "pendingRequests": 0
+    "readyCount": 3, "busyCount": 1, "openingCount": 1, "deadCount": 0,
+    "pendingRequests": 0,
+    "toolUseIndex": 0,
+    "defaultGroup": "claude-opus-4-7-thinking-max-fast",
+    "groups": [
+      { "model": "claude-opus-4-7-thinking-max-fast", "isDefault": true,
+        "draining": false,
+        "target": 3, "actual": 3,
+        "ready": 2, "busy": 1, "opening": 0, "dead": 0,
+        "rounds": 14 },
+      { "model": "claude-haiku-4-5-fast", "isDefault": false,
+        "draining": false,
+        "target": 2, "actual": 2,
+        "ready": 1, "busy": 0, "opening": 1, "dead": 0,
+        "rounds": 7 }
+    ]
   },
   "config": {
-    "model": "claude-opus-4-7-thinking-max-fast",
-    "idlePingMs": 1200000,    // 20 min
-    "openRetryMs": 300,
-    "openRetryMax": 300
+    "model": "claude-opus-4-7-thinking-max-fast",   // default group
+    "toolMode": "translate", "bridgeProtocol": "h1",
+    "contextMode": "full", "reinjectThinking": 1,
+    "concurrentOpens": 5,
+    "groupWaitMs": 5000,                            // POOL_GROUP_WAIT_MS
+    "idlePingMs": 1200000, "pingTimeoutMs": 45000,
+    "poolToolsContractCount": 14,                   // contract-mode tool count
+    "poolToolsSignature": "Bash,Edit,Read,..."
   }
 }
 ```
@@ -184,3 +244,25 @@ Wire format: newline-delimited JSON. One line = one message.
 
 6. **API server is stateless.** All persistent state lives in the pool manager.
    Restarting api-server.mjs reconnects to the same pool, loses no warm channels.
+
+7. **Groups are pool-side only.** Each channel is owned by exactly one group
+   (its `group` field is the group's model id). LRU pick + idle-ping +
+   auto-respawn + ramp are per-group operations. The default group is
+   always defined by `POOL_MODEL`/`POOL_SIZE` and cannot be removed.
+
+8. **Global open budget.** `POOL_CONCURRENT_OPENS` is a single rate-limit
+   budget across all groups against Cursor's `/Run` endpoint. The opener
+   round-robins through groups that still need channels, but the total
+   number of channels in `spawning`/`opening` state at any moment is
+   capped by `POOL_CONCURRENT_OPENS`.
+
+9. **Channel ids are globally monotonic.** `ch-0`, `ch-1`, ... are minted
+   from a single counter regardless of which group owns the channel.
+   Restart by channel id still works the same way.
+
+10. **Fallback to default.** A `request` with `model` set to an unknown or
+    draining group falls back to the default group. If the named group
+    exists but has zero ready channels, the request waits up to
+    `POOL_GROUP_WAIT_MS` for one to surface, then falls back. The
+    `route_decision` event carries `fallback: true` and `fallbackReason`
+    so the api-server can stamp the response headers.

@@ -3,6 +3,13 @@
 // tracks state, routes requests, pings idle workers, auto-respawns dead
 // ones. Exposes Unix socket /tmp/ratlc-pool.sock to api-server and
 // ratlc-ctl. See ./IPC.md for the wire format.
+//
+// Multi-group: channels are partitioned into named GROUPS, each keyed by
+// model id. The DEFAULT group is sized by POOL_MODEL/POOL_SIZE. Extra
+// groups can be declared at boot via POOL_GROUPS or added/removed at
+// runtime via the add_group/remove_group socket ops. Per-request routing
+// uses the requested model to pick the matching group; on miss, falls
+// back to the default group. See MULTI_GROUP_PLAN.md for the design.
 
 import { fork } from 'node:child_process';
 import net from 'node:net';
@@ -18,42 +25,35 @@ const __dirname = path.dirname(__filename);
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '2', 10);
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 const POOL_MODEL = process.env.POOL_MODEL || 'claude-opus-4-7-thinking-max-fast';
-const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);  // 20 min
+const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);
 const PING_TIMEOUT_MS = parseInt(process.env.PING_TIMEOUT_MS || '45000', 10);
-const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10); // wait between worker spawns
+const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10);
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
-// Protocol the bridge workers use to talk to Cursor's backend.
-//   h2 (default) — HTTP/2 BiDi via /agent.v1.AgentService/Run
-//   h1           — HTTP/1.1 via BidiAppend + RunSSE pair (rate-limit hypothesis)
-// Propagated to each forked worker as BRIDGE_PROTOCOL. See
-// scaffolding/pool/RUNSSE.md for the protocol notes.
 const POOL_BRIDGE_PROTOCOL = (process.env.POOL_BRIDGE_PROTOCOL || 'h2').toLowerCase();
 if (!['h1', 'h2'].includes(POOL_BRIDGE_PROTOCOL)) {
   console.error(`invalid POOL_BRIDGE_PROTOCOL=${POOL_BRIDGE_PROTOCOL} (must be h1|h2)`);
   process.exit(1);
 }
-// POOL_CONTEXT_MODE — see api-server.mjs / bridge-worker.mjs for semantics.
-// Propagated to every forked worker so the priming prompt matches what
-// api-server actually sends each turn.
 const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
 if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
   console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last)`);
   process.exit(1);
 }
-// POOL_REINJECT_THINKING — opt-in symmetry with CURSOR_REINJECT_THINKING
-// in server.js. Captures thinking_delta events from the bridge per
-// convKey and re-injects them as `<thinking>...</thinking>` text on the
-// next turn. Default OFF (no behavior change). The actual buffering
-// lives in api-server.mjs; pool-manager just forwards the env var to
-// each spawned worker (so bridge-worker doesn't have to read it on
-// its own — the env is already in the process tree).
 const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
-// How many channels are allowed to run the retry lottery concurrently.
-// Default 1 (sequential, safe against rate-limit). Set higher to bring the
-// pool up faster at risk of tripping ERROR_PRO_USER_RATE_LIMIT_EXCEEDED.
-// 2 is usually fine on a fresh quota; 3+ regularly trips.
+// Global rate-limit budget shared across all groups (one account quota
+// against Cursor's /Run endpoint). At most this many channels can be in
+// the spawning/opening retry lottery at once.
 const POOL_CONCURRENT_OPENS = Math.max(1, parseInt(process.env.POOL_CONCURRENT_OPENS || '1', 10));
-const WORKER_SCRIPT = path.join(__dirname, 'bridge-worker.mjs');
+// How long a request will wait for its target group to surface a ready
+// channel before being eligible for fallback to the default group. Used
+// when the target group exists but all its channels are opening / busy.
+// 0 = fall back immediately.
+const POOL_GROUP_WAIT_MS = Math.max(0, parseInt(process.env.POOL_GROUP_WAIT_MS || '5000', 10));
+// Test hook: fork mock-worker.mjs instead of bridge-worker.mjs so the
+// multi-group test suite can exercise routing without paying Cursor's
+// retry lottery. NEVER set this outside tests.
+const POOL_TEST_MOCK_CHANNELS = process.env.POOL_TEST_MOCK_CHANNELS === '1';
+const WORKER_SCRIPT = path.join(__dirname, POOL_TEST_MOCK_CHANNELS ? 'mock-worker.mjs' : 'bridge-worker.mjs');
 
 if (!['contract', 'translate'].includes(POOL_TOOL_MODE)) {
   console.error(`invalid POOL_TOOL_MODE=${POOL_TOOL_MODE} (must be contract|translate)`);
@@ -62,52 +62,69 @@ if (!['contract', 'translate'].includes(POOL_TOOL_MODE)) {
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [pool]`, ...args);
 
+// ── Groups ───────────────────────────────────────────────────────────────
+// A Group is a named partition of the pool keyed by `model`. Channels in
+// the group are all opened with that model. The DEFAULT group is keyed
+// by POOL_MODEL.
+//
+//   { model, isDefault, targetSize, channels: Set<channelId>, draining: bool }
+//
+// `draining` is set by remove_group — refuse new requests, let in-flight
+// finish, then evict the group entry when channel count hits 0.
+const groups = new Map();
+
+function makeGroup(model, targetSize, isDefault = false) {
+  return { model, isDefault, targetSize: Math.max(0, targetSize | 0), channels: new Set(), draining: false };
+}
+
+function getDefaultGroup() {
+  return groups.get(POOL_MODEL);
+}
+
+function parsePoolGroupsEnv() {
+  const raw = (process.env.POOL_GROUPS || '').trim();
+  if (!raw) return [];
+  const out = [];
+  for (const piece of raw.split(',')) {
+    const s = piece.trim();
+    if (!s) continue;
+    const m = s.match(/^([^:]+):(\d+)$/);
+    if (!m) {
+      log(`POOL_GROUPS: ignoring malformed entry "${s}" (want "model:N")`);
+      continue;
+    }
+    const model = m[1].trim();
+    const size = parseInt(m[2], 10);
+    if (!model || !Number.isFinite(size) || size < 0) {
+      log(`POOL_GROUPS: ignoring entry "${s}" (invalid model or size)`);
+      continue;
+    }
+    out.push({ model, size, foldIntoDefault: model === POOL_MODEL });
+  }
+  return out;
+}
+
 // ── Worker (channel) record ──────────────────────────────────────────────
 let nextChannelSeq = 0;
-const channels = new Map();   // channelId -> { id, proc, state, ..., currentRequestId, anthropicByExecId }
+const channels = new Map();
 
-// Pending requests waiting for a ready channel
-const requestQueue = [];      // [{ requestId, action, payload, client }]
-
-// Map anthropic_tool_use_id -> { channelId, execId }
-// (set when manager forwards a tool_use to a client; consulted on send_tool_result)
+const requestQueue = [];
 const toolUseIndex = new Map();
-
-// Map requestId -> client socket (so we know where to stream events back)
 const requestClient = new Map();
 
-// Empirical finding: Cursor only reads tools from requestContextResult ONCE
-// per stream (at the first requestContextArgs cycle, near stream open). So
-// tools must be set at worker open and CANNOT be updated mid-stream.
-//
-// Two modes:
-//   contract  — first client request's tools become the pool's tool list;
-//               subsequent mismatched requests trigger a full recycle.
-//               Workers stay 'spawning' until first request bootstraps.
-//   translate — workers open immediately with a tiny placeholder tool list
-//               that triggers Cursor to inject its full default toolset
-//               (Shell/Read/Write/Grep/Glob/StrReplace/...). Caller-side
-//               tool names are mapped via tool-translator.mjs. No recycle.
+// Empirical: Cursor only reads tools from requestContextResult ONCE per
+// stream. Tools are pinned at worker open. The contract is GLOBAL across
+// groups (claude-code uses consistent tools regardless of model).
 let poolTools = null;
 let poolSystem = null;
 let toolsSignature = '';
 
 if (POOL_TOOL_MODE === 'translate') {
-  // Pre-set the contract so spawn() opens immediately with translate-mode tools.
   poolTools = defaultTranslateModeTools();
   poolSystem = '';
   toolsSignature = 'translate-mode-static';
 }
 
-// Signature mode controls how strictly we compare tool lists between
-// requests to decide whether to recycle the pool.
-//   'name'   — tool name set must match. Schema drift is absorbed
-//              silently (model uses the pool's open-time schema).
-//   'schema' — name + JSON-serialized input_schema must match.
-//              Any field-level change triggers a recycle.
-// Default 'name' is much more forgiving for claude-code, which can
-// add/remove optional schema fields between versions without changing
-// tool surface.
 const POOL_SIG_MODE = (process.env.POOL_SIG_MODE || 'name').toLowerCase();
 
 function signatureOf(tools) {
@@ -118,7 +135,6 @@ function signatureOf(tools) {
       .map((t) => `${t.name}:${JSON.stringify(t.input_schema || t.jsonSchema || {})}`)
       .sort().join('|');
   }
-  // name-only (default)
   return filtered.map((t) => t.name).sort().join(',');
 }
 
@@ -137,35 +153,19 @@ function reopenAllChannels() {
   for (const ch of channels.values()) {
     try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
   }
-  // exit handlers will respawn through maybeSpawnNext (sequentially).
 }
 
 // ── Channel management ──────────────────────────────────────────────────
-function spawnChannel() {
+function spawnChannel(group) {
   const channelId = `ch-${nextChannelSeq++}`;
   const env = {
     ...process.env,
     RATLC_CHANNEL_ID: channelId,
-    RATLC_MODEL: POOL_MODEL,
-    // Propagate the bridge transport choice to each worker.
+    RATLC_MODEL: group.model,
     BRIDGE_PROTOCOL: POOL_BRIDGE_PROTOCOL,
-    // Propagate the context-rendering mode so the worker's priming prompt
-    // matches the shape of the prompts api-server will deliver each turn.
     POOL_CONTEXT_MODE,
-    // Propagate the reinject-thinking flag. Workers don't read it
-    // themselves (the buffer lives in api-server), but forwarding via
-    // env keeps the whole process tree on a consistent setting and
-    // makes status snapshots accurate.
     POOL_REINJECT_THINKING: POOL_REINJECT_THINKING ? '1' : '0',
-    // In translate mode, the worker tells startConversation to passthrough
-    // native Cursor tools (Shell/Read/Write/Grep/Fetch) as MCP-shape
-    // tool_use events with Anthropic names (Bash/Read/Write/Grep/WebFetch).
     RATLC_PASSTHROUGH_NATIVE: POOL_TOOL_MODE === 'translate' ? '1' : '0',
-    // In translate mode, native tool calls round-trip through the API
-    // client (claude-code), which can take seconds-to-minutes. The
-    // default stall watchdog assumes Cursor will continue emitting
-    // frames; here it has to wait on us. Bump the threshold to 30 min
-    // so the watchdog doesn't trip while we wait on the client.
     ...(POOL_TOOL_MODE === 'translate' ? {
       CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT: '1800000',
       CURSOR_STALL_TIMEOUT_MS: '600000',
@@ -177,18 +177,20 @@ function spawnChannel() {
     id: channelId,
     proc,
     pid: proc.pid,
+    group: group.model,
     state: 'spawning',
     openAttempts: 0,
     openedAt: 0,
     lastActivityAt: Date.now(),
     spawnedAt: Date.now(),
     currentRequestId: null,
-    pendingExecId: null,        // execId of an in-flight non-yield tool_use
+    pendingExecId: null,
     pendingAnthropicId: null,
     roundsServed: 0,
     error: null,
   };
   channels.set(channelId, ch);
+  group.channels.add(channelId);
 
   proc.on('message', (msg) => handleWorkerMessage(ch, msg));
   proc.on('exit', (code, signal) => handleWorkerExit(ch, code, signal));
@@ -196,19 +198,14 @@ function spawnChannel() {
     log(`channel ${channelId} proc error:`, err.message);
   });
 
-  // If we already have a pool contract, open with those tools now. Otherwise
-  // the worker sits in `spawning` until the first client request bootstraps
-  // the contract.
   if (poolTools !== null) {
-    proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+    proc.send({ type: 'open', model: group.model, tools: poolTools, system: poolSystem });
   }
-  log(`spawned ${channelId} (pid=${proc.pid}); pool size=${channels.size}`);
+  log(`spawned ${channelId} (pid=${proc.pid}, group=${group.model}); pool size=${channels.size}`);
   return ch;
 }
 
 function handleWorkerMessage(ch, msg) {
-  // Clear ping timer FIRST — ping responses don't have a requestClient mapping,
-  // so they would skip forwardToClient and the timer would leak.
   if (msg.type === 'yield' && ch._pingTimer && ch.currentRequestId &&
       String(ch.currentRequestId).startsWith('ping-')) {
     clearTimeout(ch._pingTimer);
@@ -237,12 +234,15 @@ function handleWorkerMessage(ch, msg) {
       ch.lastActivityAt = msg.lastActivityAt || ch.lastActivityAt;
       ch.error = msg.error || null;
       if (msg.state === 'ready') {
-        log(`channel ${ch.id} READY after ${ch.openAttempts} attempts (${((Date.now() - ch.spawnedAt) / 1000).toFixed(1)}s)`);
+        log(`channel ${ch.id} (group=${ch.group}) READY after ${ch.openAttempts} attempts (${((Date.now() - ch.spawnedAt) / 1000).toFixed(1)}s)`);
+        const g = groups.get(ch.group);
+        if (g && g.draining) {
+          log(`channel ${ch.id} reached READY but group ${ch.group} is draining — killing`);
+          try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
+          return;
+        }
         setImmediate(drainQueue);
-        // A channel just became ready — see if we should spawn the next one.
         setImmediate(maybeSpawnNext);
-      } else if (msg.state === 'dead') {
-        // Worker reported dead but hasn't exited yet — spawn replacement on exit hook.
       }
       break;
 
@@ -266,9 +266,10 @@ function handleWorkerMessage(ch, msg) {
 }
 
 function handleWorkerExit(ch, code, signal) {
-  log(`channel ${ch.id} exited code=${code} signal=${signal} state=${ch.state}`);
+  log(`channel ${ch.id} (group=${ch.group}) exited code=${code} signal=${signal} state=${ch.state}`);
   channels.delete(ch.id);
-  // Fail any in-flight request bound to this channel.
+  const g = groups.get(ch.group);
+  if (g) g.channels.delete(ch.id);
   if (ch.currentRequestId) {
     const client = requestClient.get(ch.currentRequestId);
     if (client) {
@@ -280,14 +281,13 @@ function handleWorkerExit(ch, code, signal) {
     }
     requestClient.delete(ch.currentRequestId);
   }
-  // Try to respawn — but only when there's no other channel already in the
-  // middle of opening (to avoid concurrent lotteries hammering the account
-  // rate limit).
+  if (g && g.draining && g.channels.size === 0) {
+    groups.delete(g.model);
+    log(`group ${g.model} fully drained — removed`);
+  }
   setTimeout(maybeSpawnNext, 500);
 }
 
-// Concurrent-open guard: at most POOL_CONCURRENT_OPENS channels in
-// spawning/opening state at once. Default 1 (rate-limit safe).
 function countOpening() {
   let n = 0;
   for (const ch of channels.values()) {
@@ -297,13 +297,19 @@ function countOpening() {
 }
 
 function maybeSpawnNext() {
-  while (channels.size < currentTargetSize && countOpening() < POOL_CONCURRENT_OPENS) {
-    spawnChannel();
+  while (countOpening() < POOL_CONCURRENT_OPENS) {
+    let spawned = false;
+    for (const g of groups.values()) {
+      if (g.draining) continue;
+      if (g.channels.size < g.targetSize) {
+        spawnChannel(g);
+        spawned = true;
+        if (countOpening() >= POOL_CONCURRENT_OPENS) return;
+      }
+    }
+    if (!spawned) return;
   }
 }
-
-// Target pool size, mutable via ramp_up / ramp_down
-let currentTargetSize = POOL_SIZE;
 
 function forwardToClient(ch, msg) {
   const reqId = msg.requestId;
@@ -312,7 +318,6 @@ function forwardToClient(ch, msg) {
   if (!client) return;
 
   if (msg.type === 'tool_use') {
-    // Manager mints the anthropic_id and remembers (channelId, execId).
     const anthropic_id = 'toolu_' + randomUUID().replace(/-/g, '').slice(0, 16);
     toolUseIndex.set(anthropic_id, { channelId: ch.id, execId: msg.execId });
     ch.pendingExecId = msg.execId;
@@ -324,7 +329,6 @@ function forwardToClient(ch, msg) {
       name: msg.name,
       args: msg.args,
     });
-    // Channel stays busy until tool_result feeds back.
     return;
   }
 
@@ -334,6 +338,11 @@ function forwardToClient(ch, msg) {
     requestClient.delete(reqId);
     writeToClient(client, { type: 'yield', requestId: reqId });
     setImmediate(drainQueue);
+    const g = groups.get(ch.group);
+    if (g && g.draining) {
+      log(`channel ${ch.id} idle on draining group ${ch.group} — killing`);
+      try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
+    }
     return;
   }
 
@@ -344,40 +353,117 @@ function forwardToClient(ch, msg) {
     return;
   }
 
-  // text_delta / thinking_delta / step_completed — pass through as-is.
-  // thinking_delta carries the model's emitted reasoning text; api-server
-  // buffers it per-convKey for proxy-side re-injection
-  // (POOL_REINJECT_THINKING). The data is NOT relayed downstream to
-  // claude-code — see api-server.mjs for the policy.
   writeToClient(client, msg);
 }
 
 // ── Routing ─────────────────────────────────────────────────────────────
-function pickReadyChannel() {
-  // Pick least-recently-used ready channel
+function pickReadyChannelInGroup(g) {
   let best = null;
-  for (const ch of channels.values()) {
-    if (ch.state !== 'ready') continue;
+  for (const channelId of g.channels) {
+    const ch = channels.get(channelId);
+    if (!ch || ch.state !== 'ready') continue;
     if (!best || ch.lastActivityAt < best.lastActivityAt) best = ch;
   }
   return best;
 }
 
+function tryPickForJob(job) {
+  const dflt = getDefaultGroup();
+  if (!dflt) return null;
+  const requestedModel = job.model;
+  if (requestedModel) {
+    const g = groups.get(requestedModel);
+    if (g && !g.draining) {
+      const ch = pickReadyChannelInGroup(g);
+      if (ch) {
+        return { channel: ch, servedModel: g.model, fallback: false, fallbackReason: null };
+      }
+      // Known target group but no ready channel yet — caller decides
+      // whether to wait or fall back via job.fallbackArmed.
+      return null;
+    }
+    if (!job.fallbackArmed) {
+      job.fallbackArmed = true;
+      job.fallbackReason = g ? 'group-draining' : 'unknown-model';
+    }
+  }
+  const ch = pickReadyChannelInGroup(dflt);
+  if (ch) {
+    const fallback = !!requestedModel && requestedModel !== dflt.model;
+    return {
+      channel: ch,
+      servedModel: dflt.model,
+      fallback,
+      fallbackReason: fallback ? (job.fallbackReason || 'unknown-model') : null,
+    };
+  }
+  return null;
+}
+
+function armFallbackTimer(job) {
+  if (job.waitTimer || !job.model) return;
+  const g = groups.get(job.model);
+  if (!g || g.draining) return;
+  if (job.model === POOL_MODEL) return;
+  job.waitTimer = setTimeout(() => {
+    job.waitTimer = null;
+    job.fallbackArmed = true;
+    job.fallbackReason = 'group-no-ready';
+    log(`req ${job.requestId}: target group ${job.model} had no ready channel within ${POOL_GROUP_WAIT_MS}ms — eligible for default fallback`);
+    setImmediate(drainQueue);
+  }, POOL_GROUP_WAIT_MS);
+}
+
+function clearJobTimers(job) {
+  if (job.waitTimer) { clearTimeout(job.waitTimer); job.waitTimer = null; }
+}
+
 function drainQueue() {
-  while (requestQueue.length > 0) {
-    const job = requestQueue[0];
-    const ch = pickReadyChannel();
-    if (!ch) return;
-    requestQueue.shift();
-    routeRequest(job, ch);
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (let i = 0; i < requestQueue.length; i++) {
+      const job = requestQueue[i];
+      let pick;
+      if (job.fallbackArmed) {
+        const dflt = getDefaultGroup();
+        const ch = dflt ? pickReadyChannelInGroup(dflt) : null;
+        if (ch) {
+          pick = { channel: ch, servedModel: dflt.model, fallback: true, fallbackReason: job.fallbackReason || 'unknown-model' };
+        }
+      } else {
+        pick = tryPickForJob(job);
+      }
+      if (!pick) continue;
+      requestQueue.splice(i, 1);
+      clearJobTimers(job);
+      routeRequest(job, pick);
+      progress = true;
+      break;
+    }
   }
 }
 
-function routeRequest(job, ch) {
+function routeRequest(job, pick) {
+  const ch = pick.channel;
   ch.currentRequestId = job.requestId;
   ch.state = 'busy';
   ch.lastActivityAt = Date.now();
   requestClient.set(job.requestId, job.client);
+  writeToClient(job.client, {
+    type: 'route_decision',
+    requestId: job.requestId,
+    channelId: ch.id,
+    servedModel: pick.servedModel,
+    requestedModel: job.model || null,
+    fallback: !!pick.fallback,
+    fallbackReason: pick.fallbackReason || null,
+  });
+  if (pick.fallback) {
+    log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel}, FALLBACK from ${job.model}, reason=${pick.fallbackReason})`);
+  } else if (job.model) {
+    log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel})`);
+  }
   if (job.action === 'send_user_message') {
     ch.proc.send({
       type: 'send_user_message',
@@ -404,24 +490,19 @@ setInterval(() => {
     if (ch.state !== 'ready') continue;
     if (now - ch.lastActivityAt < IDLE_PING_MS) continue;
     const pingReqId = 'ping-' + randomUUID().slice(0, 8);
-    log(`pinging idle ${ch.id} (idle for ${Math.floor((now - ch.lastActivityAt) / 1000)}s)`);
+    log(`pinging idle ${ch.id} (group=${ch.group}, idle for ${Math.floor((now - ch.lastActivityAt) / 1000)}s)`);
     ch.currentRequestId = pingReqId;
     ch.state = 'busy';
     ch.lastActivityAt = now;
-    // Set up a timeout to detect ping failure
     const pingTimer = setTimeout(() => {
       log(`ping timeout on ${ch.id}; killing for respawn`);
       try { ch.proc.kill('SIGTERM'); } catch { /* ignore */ }
     }, PING_TIMEOUT_MS);
-    // Store the timer so we can clear it on yield
     ch._pingTimer = pingTimer;
     ch.proc.send({ type: 'ping', requestId: pingReqId });
   }
 }, 30_000);
 
-// (Ping timer clearing is handled at the top of handleWorkerMessage.)
-
-// ── Client socket plumbing (Unix socket) ─────────────────────────────────
 function writeToClient(client, obj) {
   if (!client || client.destroyed) return;
   try {
@@ -433,32 +514,19 @@ function writeToClient(client, obj) {
 
 function handleClientMessage(client, msg) {
   if (msg.type === 'request') {
-    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results } = msg;
+    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model } = msg;
 
     if (action === 'send_user_message') {
-      // Tool list bootstrap / recycle logic only runs in CONTRACT mode.
-      // In TRANSLATE mode the pool always opens with a fixed placeholder
-      // tool list (which triggers Cursor's default toolset to be injected
-      // into the model's prompt); caller tools are translated on the wire.
       if (POOL_TOOL_MODE === 'contract') {
         const incomingTools = tools || [];
-        // claude-code (and similar Anthropic SDK clients) issues parallel
-        // requests with mixed tool surfaces: some POSTs send tools=[] (e.g.
-        // token-count probes / system-reminder pings), others send the
-        // actual tool list. Empty-tools requests must NEVER bootstrap or
-        // recycle the contract — otherwise an empty probe arriving before
-        // the real request sets the contract to [], then the next real
-        // request triggers a recycle.
         const isEmptyToolsProbe = incomingTools.length === 0;
-
         if (!isEmptyToolsProbe) {
           if (poolTools === null) {
-            // First non-empty request bootstraps the contract.
             setPoolContract(system, incomingTools);
             log(`pool contract set: tools=${incomingTools.length} (${(incomingTools.map(t=>t.name).join(',')).slice(0, 80)})`);
             for (const ch of channels.values()) {
               if (ch.state === 'spawning') {
-                ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+                ch.proc.send({ type: 'open', model: ch.group, tools: poolTools, system: poolSystem });
               }
             }
           } else if (poolNeedsReopen(incomingTools)) {
@@ -472,30 +540,29 @@ function handleClientMessage(client, msg) {
             return;
           }
         }
-        // Empty-tools probes always fall through and route to whatever
-        // the pool has. If no channel is ready yet (we're still spawning
-        // because no real contract has come in), the request queues
-        // naturally via the routeRequest path.
       }
-      // TRANSLATE mode: pool is pre-warmed with placeholder tools, nothing
-      // to bootstrap or recycle.
 
-      const ch = pickReadyChannel();
-      const payload = { text };
-      if (ch) {
-        routeRequest({ requestId, action, payload, client }, ch);
-      } else {
-        log(`no ready channel — queuing requestId=${requestId} (queue depth ${requestQueue.length + 1})`);
-        requestQueue.push({ requestId, action, payload, client });
+      const job = {
+        requestId, action,
+        payload: { text },
+        client,
+        model: model || null,
+        queuedAt: Date.now(),
+        waitTimer: null,
+        fallbackArmed: false,
+        fallbackReason: null,
+      };
+      requestQueue.push(job);
+      armFallbackTimer(job);
+      drainQueue();
+      const stillQueued = requestQueue.includes(job);
+      if (stillQueued) {
+        log(`no ready channel for req=${requestId} model=${model || '(default)'} — queued (queue depth ${requestQueue.length})`);
       }
       return;
     }
 
     if (action === 'send_tool_result') {
-      // Legacy single-result action. Kept for backwards-compat. The
-      // parallel-tools fix prefers `send_tool_results` (plural) so a single
-      // POST carrying N parallel tool_results goes to the same channel in
-      // one IPC batch.
       const entry = toolUseIndex.get(anthropic_tool_use_id);
       log(`route send_tool_result requestId=${requestId} anthropic_tool_use_id=${anthropic_tool_use_id} found=${!!entry} indexSize=${toolUseIndex.size}`);
       if (!entry) {
@@ -510,22 +577,21 @@ function handleClientMessage(client, msg) {
         writeToClient(client, { type: 'error', requestId, message: `channel ${entry.channelId} no longer alive` });
         return;
       }
-      log(`  ✅ routing to ${entry.channelId} execId=${entry.execId} (state was ${ch.state})`);
+      log(`  ✅ routing to ${entry.channelId} (group=${ch.group}) execId=${entry.execId} (state was ${ch.state})`);
       ch.currentRequestId = requestId;
       ch.state = 'busy';
       ch.lastActivityAt = Date.now();
       requestClient.set(requestId, client);
+      writeToClient(client, {
+        type: 'route_decision', requestId, channelId: ch.id,
+        servedModel: ch.group, requestedModel: model || ch.group,
+        fallback: false, fallbackReason: null,
+      });
       ch.proc.send({ type: 'send_tool_result', requestId, execId: entry.execId, content });
       return;
     }
 
     if (action === 'send_tool_results') {
-      // Parallel-tools fix: a single POST may carry N tool_result blocks
-      // (one per parallel tool_use the model emitted in its previous
-      // assistant turn). Resolve every anthropic_tool_use_id against the
-      // toolUseIndex; ALL must resolve to the SAME channel (they will, by
-      // construction — they were emitted by one channel in one assistant
-      // turn). Defensively error out on mismatch.
       const rs = Array.isArray(results) ? results : [];
       if (rs.length === 0) {
         writeToClient(client, { type: 'error', requestId, message: 'send_tool_results: empty results array' });
@@ -558,13 +624,17 @@ function handleClientMessage(client, msg) {
         writeToClient(client, { type: 'error', requestId, message: `channel ${channelId} no longer alive` });
         return;
       }
-      // Per-id delete from the index (each id resolves only once).
       for (const r of resolved) toolUseIndex.delete(r.anthropic_tool_use_id);
-      log(`  ✅ routing ${resolved.length} result(s) to ${channelId} execIds=[${resolved.map(r => r.execId).join(', ')}] (state was ${ch.state})`);
+      log(`  ✅ routing ${resolved.length} result(s) to ${channelId} (group=${ch.group}) execIds=[${resolved.map(r => r.execId).join(', ')}] (state was ${ch.state})`);
       ch.currentRequestId = requestId;
       ch.state = 'busy';
       ch.lastActivityAt = Date.now();
       requestClient.set(requestId, client);
+      writeToClient(client, {
+        type: 'route_decision', requestId, channelId: ch.id,
+        servedModel: ch.group, requestedModel: model || ch.group,
+        fallback: false, fallbackReason: null,
+      });
       ch.proc.send({
         type: 'send_tool_results', requestId,
         results: resolved.map((r) => ({ execId: r.execId, content: r.content })),
@@ -581,30 +651,104 @@ function handleClientMessage(client, msg) {
     return;
   }
 
+  if (msg.type === 'list_groups') {
+    writeToClient(client, { type: 'groups', groups: groupsSnapshot() });
+    return;
+  }
+
+  if (msg.type === 'add_group') {
+    const m = String(msg.model || '').trim();
+    const size = Math.max(0, parseInt(msg.size || 0, 10));
+    if (!m) {
+      writeToClient(client, { type: 'error', message: 'add_group: model required' });
+      return;
+    }
+    if (groups.has(m)) {
+      const g = groups.get(m);
+      if (g.draining) {
+        writeToClient(client, { type: 'error', message: `group ${m} is draining; wait for it to disappear first` });
+        return;
+      }
+      g.targetSize = size;
+      log(`add_group: existing group ${m} resized to ${size}`);
+      writeToClient(client, { type: 'ack', message: `group ${m} resized to ${size}` });
+      setImmediate(maybeSpawnNext);
+      return;
+    }
+    groups.set(m, makeGroup(m, size, false));
+    log(`add_group: ${m} targetSize=${size}`);
+    writeToClient(client, { type: 'ack', message: `group ${m} added (target=${size})` });
+    setImmediate(maybeSpawnNext);
+    return;
+  }
+
+  if (msg.type === 'remove_group') {
+    const m = String(msg.model || '').trim();
+    if (!m) {
+      writeToClient(client, { type: 'error', message: 'remove_group: model required' });
+      return;
+    }
+    const g = groups.get(m);
+    if (!g) {
+      writeToClient(client, { type: 'error', message: `group ${m} not found` });
+      return;
+    }
+    if (g.isDefault) {
+      writeToClient(client, { type: 'error', message: 'cannot remove default group' });
+      return;
+    }
+    g.draining = true;
+    g.targetSize = 0;
+    log(`remove_group: ${m} marked for draining (${g.channels.size} channels)`);
+    for (const cid of g.channels) {
+      const ch = channels.get(cid);
+      if (!ch) continue;
+      if (ch.state === 'ready' || ch.state === 'spawning' || ch.state === 'opening') {
+        try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
+      }
+    }
+    writeToClient(client, { type: 'ack', message: `group ${m} draining (${g.channels.size} channels to evict)` });
+    return;
+  }
+
   if (msg.type === 'ramp_up') {
     const n = Math.max(1, parseInt(msg.count || 1, 10));
-    currentTargetSize += n;
-    log(`ramp_up by ${n} → target=${currentTargetSize}`);
-    // Sequential — just nudge the spawn loop, which respects "one opening at a time".
+    const targetModel = (msg.group && String(msg.group).trim()) || POOL_MODEL;
+    const g = groups.get(targetModel);
+    if (!g) {
+      writeToClient(client, { type: 'error', message: `ramp_up: unknown group ${targetModel} (use add_group first)` });
+      return;
+    }
+    if (g.draining) {
+      writeToClient(client, { type: 'error', message: `ramp_up: group ${targetModel} is draining` });
+      return;
+    }
+    g.targetSize += n;
+    log(`ramp_up by ${n} on group ${targetModel} → target=${g.targetSize}`);
     setImmediate(maybeSpawnNext);
-    writeToClient(client, { type: 'ack', message: `ramping up ${n} (target=${currentTargetSize}, sequential)` });
+    writeToClient(client, { type: 'ack', message: `ramping up ${n} on ${targetModel} (target=${g.targetSize}, sequential)` });
     return;
   }
 
   if (msg.type === 'ramp_down') {
     const n = Math.max(1, parseInt(msg.count || 1, 10));
-    currentTargetSize = Math.max(0, currentTargetSize - n);
-    log(`ramp_down by ${n} → target=${currentTargetSize}`);
-    // Find idle ready channels first; kill busy ones last.
-    const candidates = Array.from(channels.values()).sort((a, b) => {
-      const aReady = a.state === 'ready' ? 0 : 1;
-      const bReady = b.state === 'ready' ? 0 : 1;
-      return aReady - bReady;
-    }).slice(0, n);
-    for (const ch of candidates) {
+    const targetModel = (msg.group && String(msg.group).trim()) || POOL_MODEL;
+    const g = groups.get(targetModel);
+    if (!g) {
+      writeToClient(client, { type: 'error', message: `ramp_down: unknown group ${targetModel}` });
+      return;
+    }
+    g.targetSize = Math.max(0, g.targetSize - n);
+    log(`ramp_down by ${n} on group ${targetModel} → target=${g.targetSize}`);
+    const inGroup = Array.from(g.channels)
+      .map((cid) => channels.get(cid))
+      .filter(Boolean)
+      .sort((a, b) => (a.state === 'ready' ? 0 : 1) - (b.state === 'ready' ? 0 : 1))
+      .slice(0, n);
+    for (const ch of inGroup) {
       try { ch.proc.send({ type: 'shutdown' }); } catch { /* ignore */ }
     }
-    writeToClient(client, { type: 'ack', message: `ramping down ${candidates.length} (target=${currentTargetSize})` });
+    writeToClient(client, { type: 'ack', message: `ramping down ${inGroup.length} on ${targetModel} (target=${g.targetSize})` });
     return;
   }
 
@@ -632,6 +776,33 @@ function handleClientMessage(client, msg) {
   writeToClient(client, { type: 'error', message: 'unknown command: ' + msg.type });
 }
 
+function groupsSnapshot() {
+  const out = [];
+  for (const g of groups.values()) {
+    let ready = 0, busy = 0, opening = 0, dead = 0, rounds = 0;
+    for (const cid of g.channels) {
+      const ch = channels.get(cid);
+      if (!ch) continue;
+      if (ch.state === 'ready') ready++;
+      else if (ch.state === 'busy') busy++;
+      else if (ch.state === 'opening' || ch.state === 'spawning') opening++;
+      else if (ch.state === 'dead') dead++;
+      rounds += ch.roundsServed || 0;
+    }
+    out.push({
+      model: g.model,
+      isDefault: !!g.isDefault,
+      draining: !!g.draining,
+      target: g.targetSize,
+      actual: g.channels.size,
+      ready, busy, opening, dead,
+      rounds,
+    });
+  }
+  out.sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0) || a.model.localeCompare(b.model));
+  return out;
+}
+
 function statusSnapshot() {
   const list = [];
   let readyCount = 0, busyCount = 0, openingCount = 0, deadCount = 0;
@@ -640,6 +811,7 @@ function statusSnapshot() {
     list.push({
       id: ch.id,
       pid: ch.pid,
+      group: ch.group,
       state: ch.state,
       openAttempts: ch.openAttempts,
       openedAt: ch.openedAt,
@@ -655,13 +827,20 @@ function statusSnapshot() {
     else if (ch.state === 'opening' || ch.state === 'spawning') openingCount++;
     else if (ch.state === 'dead') deadCount++;
   }
-  list.sort((a, b) => a.id.localeCompare(b.id));
+  list.sort((a, b) => {
+    if (a.group !== b.group) return a.group.localeCompare(b.group);
+    return a.id.localeCompare(b.id);
+  });
+  let configuredSize = 0;
+  for (const g of groups.values()) configuredSize += g.targetSize;
   return {
     type: 'status',
     pool: {
-      configuredSize: currentTargetSize,
+      configuredSize,
       actualSize: channels.size,
       channels: list,
+      groups: groupsSnapshot(),
+      defaultGroup: POOL_MODEL,
       readyCount, busyCount, openingCount, deadCount,
       pendingRequests: requestQueue.length,
       toolUseIndex: toolUseIndex.size,
@@ -673,6 +852,7 @@ function statusSnapshot() {
       contextMode: POOL_CONTEXT_MODE,
       reinjectThinking: POOL_REINJECT_THINKING ? 1 : 0,
       concurrentOpens: POOL_CONCURRENT_OPENS,
+      groupWaitMs: POOL_GROUP_WAIT_MS,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
       poolToolsContractCount: poolTools ? poolTools.length : null,
@@ -702,18 +882,36 @@ const server = net.createServer((socket) => {
   });
   socket.on('error', () => {});
   socket.on('close', () => {
-    // Clean up any requests bound to this client
     for (const [reqId, c] of requestClient.entries()) {
       if (c === socket) requestClient.delete(reqId);
     }
   });
 });
 server.listen(POOL_SOCK, () => {
-  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}, protocol=${POOL_BRIDGE_PROTOCOL}, contextMode=${POOL_CONTEXT_MODE}, reinjectThinking=${POOL_REINJECT_THINKING ? 1 : 0}`);
+  const groupSummary = Array.from(groups.values()).map((g) => `${g.model}:${g.targetSize}${g.isDefault ? '(default)' : ''}`).join(', ');
+  log(`listening on ${POOL_SOCK}, groups=[${groupSummary}], protocol=${POOL_BRIDGE_PROTOCOL}, contextMode=${POOL_CONTEXT_MODE}, reinjectThinking=${POOL_REINJECT_THINKING ? 1 : 0}, groupWaitMs=${POOL_GROUP_WAIT_MS}`);
 });
 
-// ── Spawn initial pool, honoring POOL_CONCURRENT_OPENS ───────────────────
-log(`bringing up initial pool target=${currentTargetSize}, up to ${POOL_CONCURRENT_OPENS} concurrent opens`);
+// ── Bootstrap groups from env ────────────────────────────────────────────
+const defaultGroup = makeGroup(POOL_MODEL, POOL_SIZE, true);
+groups.set(POOL_MODEL, defaultGroup);
+
+for (const entry of parsePoolGroupsEnv()) {
+  if (entry.foldIntoDefault) {
+    defaultGroup.targetSize += entry.size;
+    continue;
+  }
+  if (groups.has(entry.model)) {
+    const existing = groups.get(entry.model);
+    existing.targetSize += entry.size;
+    continue;
+  }
+  groups.set(entry.model, makeGroup(entry.model, entry.size, false));
+}
+
+let totalTarget = 0;
+for (const g of groups.values()) totalTarget += g.targetSize;
+log(`bringing up initial pool: ${groups.size} group(s), total target=${totalTarget}, up to ${POOL_CONCURRENT_OPENS} concurrent opens`);
 maybeSpawnNext();
 
 // ── Shutdown ─────────────────────────────────────────────────────────────
