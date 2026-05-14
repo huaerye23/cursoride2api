@@ -330,13 +330,27 @@ async function handleMessagesRequest(req, res) {
   const toolResults = findAllToolResults(lastMsg.content);
   const requestId = 'req-' + randomUUID().replace(/-/g, '').slice(0, 16);
 
-  // Set up SSE
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
+  // HTTP header write is deferred until we receive the pool's route_decision
+  // event so we can stamp x-ratlc-routed-to / x-ratlc-channel / x-ratlc-fallback
+  // before sending the SSE preamble. writeHeadersOnce() is idempotent and
+  // also called from the early-error path with no x-ratlc-* fields.
+  let headersWritten = false;
+  let routedTo = null;
+  let routedChannel = null;
+  let routeFallback = false;
+  let routeFallbackReason = null;
+  function writeHeadersOnce(extra) {
+    if (headersWritten) return;
+    headersWritten = true;
+    const hdrs = {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    };
+    if (extra) Object.assign(hdrs, extra);
+    try { res.writeHead(200, hdrs); } catch { /* client gone */ }
+  }
 
   // Anthropic message bookkeeping
   const messageId = 'msg_' + randomUUID().replace(/-/g, '').slice(0, 24);
@@ -371,6 +385,7 @@ async function handleMessagesRequest(req, res) {
   }
 
   function startMsg() {
+    writeHeadersOnce();
     sseWrite(res, 'message_start', {
       type: 'message_start',
       message: {
@@ -460,10 +475,30 @@ async function handleMessagesRequest(req, res) {
     reqHandlers.delete(requestId);
   }
 
-  startMsg();
+  // startMsg() is deferred until headers are written (after route_decision
+  // arrives). For the rare case the pool never emits route_decision (e.g.
+  // socket error), the error handler below will call writeHeadersOnce()
+  // with no x-ratlc-* fields and then startMsg() + finishMessage().
 
   reqHandlers.set(requestId, {
     onEvent: (msg) => {
+      if (msg.type === 'route_decision') {
+        routedTo = msg.servedModel || null;
+        routedChannel = msg.channelId || null;
+        routeFallback = !!msg.fallback;
+        routeFallbackReason = msg.fallbackReason || null;
+        const extra = {};
+        if (routedTo) extra['x-ratlc-routed-to'] = routedTo;
+        if (routedChannel) extra['x-ratlc-channel'] = routedChannel;
+        extra['x-ratlc-fallback'] = routeFallback ? '1' : '0';
+        if (routeFallback && routeFallbackReason) extra['x-ratlc-fallback-reason'] = routeFallbackReason;
+        writeHeadersOnce(extra);
+        if (!toolUseEmitted && !done && blockIdx === -1) {
+          startMsg();
+        }
+        log(`  route_decision req=${requestId} → ${routedChannel} group=${routedTo}${routeFallback ? ` (FALLBACK ${msg.requestedModel} → ${routedTo} reason=${routeFallbackReason})` : ''}`);
+        return;
+      }
       if (msg.type === 'text_delta') {
         emitTextDelta(msg.text);
       } else if (msg.type === 'thinking_delta') {
@@ -505,6 +540,7 @@ async function handleMessagesRequest(req, res) {
               type: 'request',
               requestId: requestId + ':auto_reject',
               action: 'send_tool_results',
+              model: model || null,
               results: [{
                 anthropic_tool_use_id: msg.anthropic_id,
                 content: `[proxy_error] ${xlated.error}`,
@@ -548,6 +584,8 @@ async function handleMessagesRequest(req, res) {
         finishMessage();
       } else if (msg.type === 'error') {
         disarmToolUseFinalizer();
+        writeHeadersOnce({ 'x-ratlc-fallback': '0' });
+        if (blockIdx === -1) startMsg();
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
         finishMessage();
       }
@@ -564,6 +602,7 @@ async function handleMessagesRequest(req, res) {
     log(`  → pool send_tool_results requestId=${requestId} count=${toolResults.length} ids=[${toolResults.map(r => r.tool_use_id).join(', ')}]`);
     poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
+      model: model || null,
       results: toolResults.map((r) => ({
         anthropic_tool_use_id: r.tool_use_id,
         content: r.text,
@@ -589,9 +628,10 @@ async function handleMessagesRequest(req, res) {
       const preamble = renderThinkingPreamble(thinkingTurns);
       text = preamble + userText;
     }
-    log(`  → pool send_user_message requestId=${requestId} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
+    log(`  → pool send_user_message requestId=${requestId} model=${model || '(default)'} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
     poolWrite({
       type: 'request', requestId, action: 'send_user_message',
+      model: model || null,
       text,
       system: extractSystemPrompt(system),
       tools: tools || [],
@@ -656,8 +696,20 @@ function handleMetrics(req, res) {
       lines.push('# HELP ratlc_channel_rounds Successful rounds served per channel.');
       lines.push('# TYPE ratlc_channel_rounds counter');
       for (const ch of (p.channels || [])) {
-        lines.push(`ratlc_channel_rounds{channel="${ch.id}"} ${ch.roundsServed || 0}`);
-        lines.push(`ratlc_channel_open_attempts{channel="${ch.id}"} ${ch.openAttempts || 0}`);
+        const grpLbl = ch.group ? `,group="${ch.group}"` : '';
+        lines.push(`ratlc_channel_rounds{channel="${ch.id}"${grpLbl}} ${ch.roundsServed || 0}`);
+        lines.push(`ratlc_channel_open_attempts{channel="${ch.id}"${grpLbl}} ${ch.openAttempts || 0}`);
+      }
+      lines.push('# HELP ratlc_group_channels Channels in a group, broken down by state.');
+      lines.push('# TYPE ratlc_group_channels gauge');
+      for (const g of (p.groups || [])) {
+        const isDflt = g.isDefault ? '1' : '0';
+        lines.push(`ratlc_group_channels{group="${g.model}",default="${isDflt}",state="ready"} ${g.ready || 0}`);
+        lines.push(`ratlc_group_channels{group="${g.model}",default="${isDflt}",state="busy"} ${g.busy || 0}`);
+        lines.push(`ratlc_group_channels{group="${g.model}",default="${isDflt}",state="opening"} ${g.opening || 0}`);
+        lines.push(`ratlc_group_channels{group="${g.model}",default="${isDflt}",state="dead"} ${g.dead || 0}`);
+        lines.push(`ratlc_group_target{group="${g.model}",default="${isDflt}"} ${g.target || 0}`);
+        lines.push(`ratlc_group_rounds{group="${g.model}",default="${isDflt}"} ${g.rounds || 0}`);
       }
       res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
       res.end(lines.join('\n') + '\n');
