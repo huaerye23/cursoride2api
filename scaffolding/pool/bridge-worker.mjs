@@ -186,7 +186,11 @@ async function openWithRetry(system, callerTools) {
   let rateLimitBackoff = 5000;
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
-    if (attempt % 10 === 1) setState('opening');  // periodic state push
+    // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
+    // activity live. The cost is one ~120-byte IPC message per retry; with
+    // POOL_CONCURRENT_OPENS=5 worst-case ~15 msgs/sec, well below anything
+    // the pool socket cares about.
+    setState('opening');
     const result = await openOnce(primingPrompt, allTools);
     if (result.kind === 'opened') {
       bridge = result.bridge;
