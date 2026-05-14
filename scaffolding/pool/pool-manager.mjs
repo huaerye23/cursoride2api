@@ -68,11 +68,27 @@ if (POOL_TOOL_MODE === 'translate') {
   toolsSignature = 'translate-mode-static';
 }
 
+// Signature mode controls how strictly we compare tool lists between
+// requests to decide whether to recycle the pool.
+//   'name'   — tool name set must match. Schema drift is absorbed
+//              silently (model uses the pool's open-time schema).
+//   'schema' — name + JSON-serialized input_schema must match.
+//              Any field-level change triggers a recycle.
+// Default 'name' is much more forgiving for claude-code, which can
+// add/remove optional schema fields between versions without changing
+// tool surface.
+const POOL_SIG_MODE = (process.env.POOL_SIG_MODE || 'name').toLowerCase();
+
 function signatureOf(tools) {
   if (!Array.isArray(tools)) return '';
-  return tools.filter((t) => t && t.name)
-    .map((t) => `${t.name}:${JSON.stringify(t.input_schema || t.jsonSchema || {})}`)
-    .sort().join('|');
+  const filtered = tools.filter((t) => t && t.name);
+  if (POOL_SIG_MODE === 'schema') {
+    return filtered
+      .map((t) => `${t.name}:${JSON.stringify(t.input_schema || t.jsonSchema || {})}`)
+      .sort().join('|');
+  }
+  // name-only (default)
+  return filtered.map((t) => t.name).sort().join(',');
 }
 
 function setPoolContract(system, tools) {
@@ -365,24 +381,41 @@ function handleClientMessage(client, msg) {
       // tool list (which triggers Cursor's default toolset to be injected
       // into the model's prompt); caller tools are translated on the wire.
       if (POOL_TOOL_MODE === 'contract') {
-        if (poolTools === null) {
-          setPoolContract(system, tools || []);
-          log(`pool contract set: tools=${(tools || []).length} system=${(system || '').slice(0, 60)}`);
-          for (const ch of channels.values()) {
-            if (ch.state === 'spawning') {
-              ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+        const incomingTools = tools || [];
+        // claude-code (and similar Anthropic SDK clients) issues parallel
+        // requests with mixed tool surfaces: some POSTs send tools=[] (e.g.
+        // token-count probes / system-reminder pings), others send the
+        // actual tool list. Empty-tools requests must NEVER bootstrap or
+        // recycle the contract — otherwise an empty probe arriving before
+        // the real request sets the contract to [], then the next real
+        // request triggers a recycle.
+        const isEmptyToolsProbe = incomingTools.length === 0;
+
+        if (!isEmptyToolsProbe) {
+          if (poolTools === null) {
+            // First non-empty request bootstraps the contract.
+            setPoolContract(system, incomingTools);
+            log(`pool contract set: tools=${incomingTools.length} (${(incomingTools.map(t=>t.name).join(',')).slice(0, 80)})`);
+            for (const ch of channels.values()) {
+              if (ch.state === 'spawning') {
+                ch.proc.send({ type: 'open', model: POOL_MODEL, tools: poolTools, system: poolSystem });
+              }
             }
+          } else if (poolNeedsReopen(incomingTools)) {
+            log(`tools mismatch — recycling pool (have=[${toolsSignature.slice(0, 60)}] want=[${signatureOf(incomingTools).slice(0, 60)}])`);
+            setPoolContract(system, incomingTools);
+            reopenAllChannels();
+            writeToClient(client, {
+              type: 'error', requestId,
+              message: 'pool recycling for new tools contract — retry in 30-180s',
+            });
+            return;
           }
-        } else if (poolNeedsReopen(tools || [])) {
-          log(`tools mismatch — recycling pool`);
-          setPoolContract(system, tools || []);
-          reopenAllChannels();
-          writeToClient(client, {
-            type: 'error', requestId,
-            message: 'pool recycling for new tools contract — retry in 30-180s',
-          });
-          return;
         }
+        // Empty-tools probes always fall through and route to whatever
+        // the pool has. If no channel is ready yet (we're still spawning
+        // because no real contract has come in), the request queues
+        // naturally via the routeRequest path.
       }
       // TRANSLATE mode: pool is pre-warmed with placeholder tools, nothing
       // to bootstrap or recycle.
