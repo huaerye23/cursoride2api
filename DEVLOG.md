@@ -1326,6 +1326,97 @@ A more honest default given the evidence: **16–32 KB per turn**, with a separa
 
 ---
 
+## RATLC pool (`scaffolding/pool/`) — warm-channel architecture
+
+A second proxy stack lives in `scaffolding/pool/`, designed for very different operating constraints than the root `server.js`. Where `server.js` opens a fresh Cursor conversation per `/v1/messages` POST (paying the probabilistic `unpaid_invoice` gate per request), the RATLC pool maintains N **pre-warmed Cursor agent streams** parked in a `bajie_yield` tool call. Each new POST is fed via the yield's tool_result, the model produces its turn, returns to yield. The lottery is paid **once per channel-lifetime**, not per request.
+
+See `scaffolding/pool/README.md` for user-facing usage and `scaffolding/pool/{H1_RESULTS,RUNSSE,FINDINGS,TOOL_USE_HANG_FINDINGS}.md` for the RE work that produced this stack.
+
+### Process topology
+
+```
+ratlc CLI                       (./scaffolding/pool/ratlc)
+  ├─ pool-manager.mjs           Forks N bridge-workers, maintains the pool
+  │   ├─ bridge-worker.mjs ──── cursor-agent.js (H2)   ── api2.cursor.sh
+  │   ├─ bridge-worker.mjs ──── cursor-agent-h1.js (H1) ── api2.cursor.sh
+  │   └─ ... up to N workers
+  └─ api-server.mjs             HTTP :4242 /v1/messages (Anthropic format)
+```
+
+Inter-process comms: api-server ↔ pool-manager over `/tmp/ratlc-pool.sock` (newline-delimited JSON); pool-manager ↔ bridge-worker over Node IPC (`process.send`). See `scaffolding/pool/IPC.md`.
+
+### HTTP/1.1 transport (commits `fd36a74`, `ecabd0f`)
+
+The root `server.js` uses `agent.v1.AgentService/Run` (BiDi gRPC over HTTP/2). At the ALB layer, this endpoint enforces a per-account rate limit (`ERROR_PRO_USER_RATE_LIMIT_EXCEEDED`) that bites at >=3 concurrent opens — making a meaningful pool impossible on H2.
+
+RATLC instead uses the IDE's `BidiAppend` (unary) + `RunSSE` (server-streaming) pair, joined by `x-request-id` UUID. Both are HTTP/1.1-compatible (verified empirically). Apparently lives on a separate ALB target group with a different rate-limit budget. See `scaffolding/pool/RUNSSE.md` for the protocol RE and `scaffolding/pool/H1_RESULTS.md` for the scale-test: 10 channels @ H1 produces **0 hard rate-limits across 221 BidiAppends**, vs 108 on H2 in the same condition.
+
+Selected via `POOL_BRIDGE_PROTOCOL=h1` (default `h2` for backward-compat).
+
+### Two context-forwarding modes (`POOL_CONTEXT_MODE=full|last`, commit `44b879d`)
+
+Pool channels are stateful Cursor conversations server-side; pool-manager picks LRU for each new POST. This means a multi-turn conversation from claude-code can hop between channels:
+
+- **`last`** (default, backward-compat): only the last user message text is forwarded. Channel accumulates per-conversation state in Cursor's model context. **Breaks** when LRU rotation routes turn 2 to a different channel — that channel has stale or unrelated history.
+- **`full`** (recommended for claude-code): every POST renders the full `messages[]` history into one self-contained prompt fed via `bajie_yield`. Channel is treated as a stateless carrier. Each delivery is independent. Survives LRU rotation cleanly.
+
+Trade-off: `full` mode re-sends the whole conversation each turn (quadratic token cost as conversations grow). Fine for typical claude-code sessions (10-30 turns); gets expensive at 100+. A future optimization is **conversation pinning** — route subsequent turns to the same channel by hashing `messages[0]` or similar — which keeps channels stateful AND preserves coherence.
+
+### Translate mode (`POOL_TOOL_MODE=translate`)
+
+Cursor's IDE has its own native tool surface (`shellArgs`, `shellStreamArgs`, `readArgs`, `writeArgs`, `grepArgs`, `fetchArgs`, etc.). Anthropic's API has its own (`Bash`, `Read`, `Write`, `Grep`, `WebFetch`). In `translate` mode, the bridge:
+
+1. Opens the channel with a placeholder MCP tool (`search_codebase`) so Cursor auto-injects its native toolset
+2. Catches the model's native tool calls (`shellStreamArgs` etc.) via `cursor-agent.js`'s passthrough handlers
+3. Forwards each as an Anthropic-named tool_use to the api-server (`shellArgs` → `Bash`, `readArgs` → `Read`, etc.)
+4. claude-code executes them using its own native tools
+5. The tool_result comes back, we convert it to Cursor's native result type (`ShellStream{stdout,exit}`, `ReadResult.success`, etc.), send via `BidiAppend`
+
+This lets claude-code "drive" Cursor's model without the model needing to learn Anthropic's tool names.
+
+The alternative is `contract` mode where the pool locks its tool list to the first request's `tools[]`. Simpler but less ergonomic.
+
+### `ExecClientControlMessage(streamClose)` requirement (commit `72c60fd`)
+
+The biggest RE discovery: every tool result sent back to Cursor must be followed by `ExecClientControlMessage(streamClose{id})` where `id` is the original `ExecServerMessage.id` (uint32, not the string `exec_id`). Without it, Cursor's backend leaves the exec slot open server-side and the model deadlocks mid-next-turn.
+
+Found by reading `workbench.desktop.main.js`'s `ControlledExecManager.handle` (~offset 22546044, class `c1c`/`$jb`). The IDE writes streamClose after every exec handler's async-generator completes — both unary (shellResult, mcpResult, readResult) and streaming (shellStream's stdout+exit).
+
+We emit it via `sendExecClientMessageAndClose()` for unary results and a trailing `sendExecClientControlMessage(id, 'streamClose', ...)` for the shellStream case.
+
+See `scaffolding/pool/TOOL_USE_HANG_FINDINGS.md` for the full diagnosis (took a multi-iteration arc with 4 layers of instrumentation before the bundle-RE found the answer).
+
+### Parallel tool calls (commit `0f6acec`)
+
+The model can fire N tool_use blocks in one assistant message. Our pipeline originally collapsed at every layer:
+
+- api-server: called `finishMessage()` after the first tool_use → only one emitted
+- api-server: `findToolResult` returned the first match → only one routed back
+- pool-manager: handled one tool_result per IPC
+- bridge-worker: `pendingMcpInfo` was a single variable → second `onMcpCall` overwrote the first
+
+The fix touches all four layers coherently. `pendingMcpInfo` is now `Map<execId, info>`. api-server buffers tool_uses and finishes on `step_completed` (or 250ms debounce backstop). The IPC protocol gained a batched `send_tool_results` action carrying `[{anthropic_tool_use_id, content}, …]`. Pool-manager defensively errors if N tool_use_ids span >1 channel (should be impossible by construction).
+
+Verified with `scaffolding/pool/parallel-tools-test.mjs` (passes 1st-attempt).
+
+### Anthropic SSE wire-format compliance (commit `35929ac`)
+
+claude-code is built on `@anthropic-ai/sdk`. Its `Usage` type declares six required fields; missing any causes `undefined + undefined = NaN` in downstream cost-accounting, which silently breaks claude-code's tool-executor pipeline. Three fixes:
+
+1. `message_start.message.model` must be a public Anthropic id (`claude-opus-4-7`), not Cursor's internal id (`claude-opus-4-7-thinking-max-fast`)
+2. `usage` must include `cache_creation_input_tokens`, `cache_read_input_tokens`, `server_tool_use`, `service_tier` (as 0 / null sentinels)
+3. `input_json_delta` should send an empty preamble (`partial_json: ""`) before the actual JSON body — matches the canonical wire shape
+
+Before this, claude-code received the tool_use and silently dropped it without ever POSTing back a tool_result.
+
+### Orthogonality to root `server.js`
+
+The RATLC pool's `api-server.mjs` is a clean parallel implementation; it shares only `src/cursor-agent.js` (and the new `src/cursor-agent-h1.js`) with `server.js`. Features like `CURSOR_REINJECT_THINKING`, `MAX_TOTAL_BYTES`, the per-stream `pendingToolCalls` rescue, etc., live entirely in `server.js` and do **not** affect the pool. Conversely, `POOL_*` env vars and the warm-channel architecture are pool-only.
+
+If you switch between the two, only one server should listen on `:4242` at a time.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
