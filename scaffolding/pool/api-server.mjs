@@ -14,8 +14,25 @@ const PORT = parseInt(process.env.PORT || '4242', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
+// POOL_CONTEXT_MODE selects how multi-turn conversations are forwarded
+// to the pool channel:
+//   last (default) — only the last user message text is sent. Backwards-
+//                    compatible. Pool channels accumulate per-conversation
+//                    state inside the model's context window, so multi-turn
+//                    coherence requires every turn of one conversation to
+//                    land on the SAME channel. LRU rotation breaks this.
+//   full           — every POST renders the entire messages[] history into
+//                    one self-contained prompt. The channel is treated as
+//                    a stateless carrier — each `bajie_yield` result is a
+//                    complete fresh request. Channel rotation is now safe.
+const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
+if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
+  console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last)`);
+  process.exit(1);
+}
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
+log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}`);
 
 // ── Pool socket connection ──────────────────────────────────────────────
 let poolSock = null;
@@ -102,6 +119,95 @@ function extractSystemPrompt(system) {
   if (typeof system === 'string') return system;
   if (Array.isArray(system)) return system.map((p) => typeof p === 'string' ? p : p.text || '').join('\n');
   return '';
+}
+
+// Render an Anthropic content block array as a flat string, stable across
+// nesting shapes. Used by renderFullContext to expand both top-level message
+// content and the inner content of tool_result blocks.
+function renderContentBlocks(blocks) {
+  if (typeof blocks === 'string') return blocks;
+  if (!Array.isArray(blocks)) return '';
+  const out = [];
+  for (const c of blocks) {
+    if (!c || typeof c !== 'object') continue;
+    if (c.type === 'text') {
+      out.push(c.text || '');
+    } else if (c.type === 'tool_use') {
+      // Show the assistant's tool call: name + JSON args.
+      const args = c.input == null ? {} : c.input;
+      out.push(`<tool_use name="${c.name || '?'}" id="${c.id || ''}">\n${JSON.stringify(args, null, 2)}\n</tool_use>`);
+    } else if (c.type === 'tool_result') {
+      // Recursively render nested content blocks. Anthropic SDK allows the
+      // result body to be either a string or an array of {type:text|image}
+      // entries; both shapes are handled.
+      const inner = typeof c.content === 'string'
+        ? c.content
+        : (Array.isArray(c.content) ? renderContentBlocks(c.content) : '');
+      const err = c.is_error ? ' is_error="true"' : '';
+      out.push(`<tool_result tool_use_id="${c.tool_use_id || ''}"${err}>\n${inner}\n</tool_result>`);
+    } else if (c.type === 'image') {
+      out.push('<image/>');
+    } else if (typeof c.text === 'string') {
+      // Tolerate untyped {text:"..."} entries (older SDKs).
+      out.push(c.text);
+    } else {
+      // Unknown block type — dump as JSON so nothing is silently dropped.
+      out.push(`<unknown type="${c.type || '?'}">${JSON.stringify(c).slice(0, 500)}</unknown>`);
+    }
+  }
+  return out.join('\n');
+}
+
+// Render the entire messages[] history into a single self-contained prompt.
+// Used when POOL_CONTEXT_MODE=full so the pool channel (which is stateless
+// across conversation turns under LRU rotation) gets the full context every
+// turn. Format design goals:
+//   - Clearly delimit user vs assistant turns
+//   - Expand tool_use blocks (tool name + args) and tool_result blocks
+//   - End with the latest user turn marked as the one to respond to
+//   - Stable across content-shape variations (string vs array, nested
+//     tool_result.content of either shape)
+function renderFullContext({ messages, system, tools }) {
+  const lines = [];
+  lines.push('=== FULL CONVERSATION CONTEXT ===');
+  lines.push('You are receiving the complete conversation history for ONE self-contained request. Respond to the FINAL user turn below. Do not assume any continuity with prior bajie_yield results — each delivery is independent and the history below is the only context you have.');
+  lines.push('');
+
+  const sys = extractSystemPrompt(system);
+  if (sys) {
+    lines.push('--- SYSTEM ---');
+    lines.push(sys);
+    lines.push('');
+  }
+
+  if (Array.isArray(tools) && tools.length > 0) {
+    lines.push('--- AVAILABLE TOOLS (for reference; use the live tool list bound to this stream) ---');
+    for (const t of tools) {
+      if (!t || !t.name) continue;
+      const desc = t.description ? ` — ${String(t.description).slice(0, 200)}` : '';
+      lines.push(`* ${t.name}${desc}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('--- CONVERSATION ---');
+  const arr = Array.isArray(messages) ? messages : [];
+  for (let i = 0; i < arr.length; i++) {
+    const m = arr[i];
+    if (!m || !m.role) continue;
+    const isLastUser = (i === arr.length - 1) && m.role === 'user';
+    const tag = isLastUser ? `[user] (RESPOND TO THIS)` : `[${m.role}]`;
+    lines.push(tag + ':');
+    const body = typeof m.content === 'string'
+      ? m.content
+      : renderContentBlocks(m.content);
+    lines.push(body || '(empty)');
+    lines.push('');
+  }
+
+  lines.push('--- END CONVERSATION ---');
+  lines.push('Respond to the final user turn now. Then call bajie_yield to wait for the next request.');
+  return lines.join('\n');
 }
 
 async function handleMessagesRequest(req, res) {
@@ -306,10 +412,17 @@ async function handleMessagesRequest(req, res) {
       anthropic_tool_use_id: toolResult.tool_use_id, content: toolResult.text,
     });
   } else {
-    log(`  → pool send_user_message requestId=${requestId} textBytes=${extractTextFromContent(lastMsg.content).length} tools=${(tools || []).length}`);
+    // Mode selection: in `full` mode, render the ENTIRE messages[] into
+    // one self-contained prompt; in `last` mode (default, backwards-
+    // compatible), forward only the last user message text. The pool
+    // socket frame is identical in both — only the `text` payload changes.
+    const text = POOL_CONTEXT_MODE === 'full'
+      ? renderFullContext({ messages, system, tools })
+      : extractTextFromContent(lastMsg.content);
+    log(`  → pool send_user_message requestId=${requestId} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length}`);
     poolWrite({
       type: 'request', requestId, action: 'send_user_message',
-      text: extractTextFromContent(lastMsg.content),
+      text,
       system: extractSystemPrompt(system),
       tools: tools || [],
     });
