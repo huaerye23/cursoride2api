@@ -55,8 +55,8 @@ the children + api-server).
 | `POOL_CONTEXT_MODE` | `full` \| `last` | `last` | How multi-turn conversations are forwarded. **`full` strongly recommended for claude-code.** See [§ Context modes](#context-modes-fullvslast) below. |
 | `POOL_CONCURRENT_OPENS` | `1`–`5` | `1` | How many channels open in parallel. `1` is safe but slow; `5` is faster but more rate-limit pressure. **At `>=5`, H2 trips the per-account rate limit**; H1 is fine. |
 | `POOL_SIZE` | integer | `1` (cli `up N` overrides) | Target channel count. `./scaffolding/pool/ratlc up N` is the easy way. |
-| `POOL_MODEL` | model id | `claude-opus-4-7-thinking-max-fast` | Which Cursor model to drive (the **default group**). |
-| `POOL_GROUPS` | `modelA:N,modelB:M,...` | unset | Extra **named groups** at boot. Each `model:N` declares a group of N channels pinned to that Cursor model. Channels are partitioned across groups; per-request `body.model` picks which group serves. Groups can also be added/removed at runtime via `ratlc add-group`/`remove-group`. |
+| `POOL_MODEL` | model id, or CSV | `claude-opus-4-7-thinking-max-fast` | Which Cursor model to drive (the **default group**). Accepts two forms: `opus` (single model, sized by `POOL_SIZE`) or CSV `opus,haiku:3` / `opus:5,haiku:3,composer-2-fast:1`. With CSV, the **first entry is the default group**; subsequent entries become additional groups (equivalent to `POOL_GROUPS`). Each entry is `model` (uses `POOL_SIZE`) or `model:size`. |
+| `POOL_GROUPS` | `modelA:N,modelB:M,...` | unset | Extra **named groups** at boot. Each `model:N` declares a group of N channels pinned to that Cursor model. Channels are partitioned across groups; per-request `body.model` picks which group serves. Groups can also be added/removed at runtime via `ratlc add-group`/`remove-group`. **Equivalent** to putting the same entries in CSV-form `POOL_MODEL` — the two are merged identically. |
 | `POOL_GROUP_WAIT_MS` | milliseconds | `5000` | When a request names a known group whose channels are all opening/busy, wait this long for one to surface before falling back to the default group. Set to `0` for immediate fallback. |
 | `POOL_REINJECT_THINKING` | `0` \| `1` | `0` | Captures the model's `thinking_delta` per `convKey`; on the next turn for the same conversation, prepends `<thinking>…</thinking>` text into the outbound prompt. Pool-side symmetry with `server.js`'s `CURSOR_REINJECT_THINKING`. See [§ Thinking continuity](#thinking-continuity) below. |
 | `POOL_REINJECT_THINKING_MAX_BYTES_PER_TURN` | int | `4096` | Cap on captured bytes per assistant turn (truncates further deltas in the same turn). Matches server.js's default. |
@@ -92,6 +92,21 @@ This brings up 13 channels total: 10 on the default Opus group + 3 on
 the Sonnet group. `POOL_CONCURRENT_OPENS` is a **global** open budget
 shared across all groups, so opens are interleaved at the
 rate-limit-safe pace, not per-group.
+
+Equivalently, you can declare every group inline via the CSV form of
+`POOL_MODEL` — handy when you want a single env line:
+
+```bash
+POOL_MODEL="claude-opus-4-7-thinking-max-fast:10,claude-4.6-sonnet-medium-fast:3" \
+POOL_BRIDGE_PROTOCOL=h1 POOL_TOOL_MODE=translate POOL_CONTEXT_MODE=full \
+POOL_CONCURRENT_OPENS=5 \
+  ./scaffolding/pool/ratlc up
+```
+
+The first CSV entry is the default group; subsequent entries become
+additional groups. Entries with no `:N` suffix fall back to `POOL_SIZE`.
+CSV-form `POOL_MODEL` and `POOL_GROUPS` are merged identically — pick
+whichever reads better for your config.
 
 ### Mutate groups at runtime
 
@@ -299,6 +314,18 @@ All three should PASS in the recommended config (`h1 + translate + full`).
   `add-group`/`remove-group`/`ramp --group`. `x-ratlc-*` response
   headers expose routing decisions + fallback reasons. See
   [§ Multi-group model pools](#multi-group-model-pools).
+- ✅ **CSV `POOL_MODEL`** — declare the default group AND additional
+  groups in one env var: `POOL_MODEL="opus:5,haiku:3,composer-2-fast:1"`.
+  Equivalent to `POOL_MODEL=opus POOL_SIZE=5 POOL_GROUPS="haiku:3,composer-2-fast:1"`.
+- ✅ **Claude-code tool coverage** in `translate` mode — the pool now
+  registers `Edit`, `Glob`, `NotebookEdit`, `TodoWrite` as MCP tools
+  under their **Anthropic-native names** (matching what claude-code
+  emits). The model sees both Cursor's native surface (`StrReplace`,
+  Cursor-`Glob`, ...) and the Anthropic-named variants, so a
+  claude-code session that calls `Edit` lands on a matching tool
+  without falling back to "X unavailable" hallucinations or Bash
+  heredocs. Round-trip validated by `tool-coverage-test.mjs` and
+  `live-claude-sim-test.mjs` against a real pool.
 
 See `H1_RESULTS.md` for the scale-test results (10 channels @ H1: 0
 hard rate-limit hits vs 108 on H2). See `TOOL_USE_HANG_FINDINGS.md`

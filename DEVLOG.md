@@ -1523,6 +1523,74 @@ summary block above it; the `:`-bar accepts `:add-group`,
 See `scaffolding/pool/MULTI_GROUP_PLAN.md` § 13 for the decision log
 of the 5 design questions resolved along the way.
 
+### Tool-coverage cleanup (2026-05-14) — closing "X unavailable" hallucinations
+
+User feedback: claude-code sessions through the pool sometimes saw the
+model output text like *"Write unavailable"* / *"StrReplace unavailable"*
+instead of calling those tools, even though the wire DOES carry them.
+Probing the running pool with a `List every tool you have access to`
+prompt confirmed the model sees Cursor's full default agent surface:
+
+```
+["Shell", "Glob", "Grep", "Read", "Delete", "StrReplace", "Write",
+ "EditNotebook", "TodoWrite", "ReadLints", "WebSearch", "WebFetch",
+ "GenerateImage", "AskQuestion", "Task", "ListMcpResources",
+ "FetchMcpResource", "SwitchMode", "bajie_yield"]
+```
+
+So the hallucination wasn't a wire-level absence — it was the model
+seeing Cursor's `StrReplace` (which expects `path/old_string/new_string`)
+in its prompt while claude-code's API contract advertises `Edit`
+(which expects `file_path/old_string/new_string`). The mismatch made
+the model second-guess itself and emit "Edit unavailable" text rather
+than try the rename.
+
+Fix: expand `defaultTranslateModeTools()` in `tool-translator.mjs` to
+register the claude-code-native names directly as MCP tools with their
+exact Anthropic schemas:
+
+- `Edit` (file_path / old_string / new_string / replace_all?)
+- `Glob` (pattern, path?)
+- `NotebookEdit` (notebook_path / new_source / cell_id? / edit_mode? / cell_type?)
+- `TodoWrite` (todos[])
+
+Names that don't conflict with Cursor's native tool surface land
+unprefixed (`Edit`, `NotebookEdit`); the ones that do
+(`Glob`, `TodoWrite`) get `mcp_` per the existing CURSOR_NATIVE_TOOL_NAMES
+rule. The model now sees BOTH Cursor's native `StrReplace`/Cursor-`Glob`/`TodoWrite`/`EditNotebook`
+**and** the Anthropic-named MCP versions, so claude-code's calls land
+directly on the matching tool. Empirically confirmed: when asked
+"call Edit with file_path=..., old_string=...", the model emits
+`tool_use(name="Edit")` with the exact claude-code arg keys, not a
+"unavailable" text fallback. See `scaffolding/pool/tool-coverage-test.mjs`
+and `live-claude-sim-test.mjs` for the live regression guards.
+
+What didn't change: the existing CURSOR_TO_ANTHROPIC_NAME map (Shell→Bash,
+StrReplace→Edit, ...) — that's the *fallback* path when the model
+calls a Cursor-native tool through the proto's specific cases, still
+needed and untouched.
+
+### CSV `POOL_MODEL` (2026-05-14) — single env line for multi-group setups
+
+`POOL_MODEL` now accepts the same CSV form as `POOL_GROUPS`:
+
+```bash
+# All of these are equivalent
+POOL_MODEL=opus POOL_SIZE=5 POOL_GROUPS="haiku:3"
+POOL_MODEL=opus,haiku:3 POOL_SIZE=5
+POOL_MODEL=opus:5,haiku:3
+```
+
+The first CSV entry is the default group (still inseparable per
+multi-group constraints). Subsequent entries become additional
+groups, merged with `POOL_GROUPS` if both are set. Entries with no
+explicit `:size` fall back to `POOL_SIZE`. Whitespace and duplicate
+entries (folded into the matching group) are tolerated. Backwards-
+compatible: single-value `POOL_MODEL=opus` still works unchanged.
+
+Covered by `scaffolding/pool/csv-pool-model-test.mjs` (8 steps,
+mock-channel based, no Cursor quota).
+
 ---
 
 ## Future work / open issues
