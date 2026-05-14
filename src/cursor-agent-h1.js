@@ -51,6 +51,7 @@ const {
   sendExecClientMessageAndClose,
   sendKvResponse,
   frameConnectMessage,
+  resolveClientFingerprint,
 } = require('./cursor-agent');
 
 // Connect-protocol "end stream" frame flag
@@ -71,11 +72,11 @@ const _port = _baseUrlParsed.port ? parseInt(_baseUrlParsed.port, 10) : 443;
 
 // ── Header fingerprint (mirror cursor-agent.js exactly) ──
 const _clientType = process.env.CURSOR_CLIENT_TYPE || 'ide';
-const _clientOs = process.env.CURSOR_CLIENT_OS || (process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows_nt' : 'linux');
-const _clientArch = process.env.CURSOR_CLIENT_ARCH || (process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch);
 const _clientDevice = process.env.CURSOR_CLIENT_DEVICE_TYPE || 'desktop';
-const _clientOsVersion = process.env.CURSOR_CLIENT_OS_VERSION || require('os').release();
 const _clientCommit = process.env.CURSOR_COMMIT || 'd5c0e77a0214208f36b56d42e8e787de88d02ea4';
+// OS/arch/version are resolved per-token via cursor-agent.js so a Mac-minted
+// token sent from a non-Mac host claims darwin instead of leaking the real
+// platform — Cursor's anti-abuse gate rejects mismatched bundles.
 const _cursorTimezone = (() => {
   try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
   catch { return 'UTC'; }
@@ -85,6 +86,7 @@ const _cursorTimezone = (() => {
 // joins the two halves into one logical BiDi stream on the server side
 // — same UUID for the RunSSE open AND every BidiAppend in that stream.
 function _commonHeaders(token, requestId, sessionId) {
+  const fp = resolveClientFingerprint(token);
   return {
     'authorization': `Bearer ${token.accessToken}`,
     'x-cursor-checksum': generateChecksum(token.machineId || '', token.macMachineId || ''),
@@ -94,10 +96,10 @@ function _commonHeaders(token, requestId, sessionId) {
     'x-session-id': sessionId,
     'x-ghost-mode': 'false',
     'x-cursor-client-type': _clientType,
-    'x-cursor-client-os': _clientOs,
-    'x-cursor-client-arch': _clientArch,
+    'x-cursor-client-os': fp.clientOs,
+    'x-cursor-client-arch': fp.clientArch,
     'x-cursor-client-device-type': _clientDevice,
-    'x-cursor-client-os-version': _clientOsVersion,
+    'x-cursor-client-os-version': fp.clientOsVersion,
     'x-cursor-commit': _clientCommit,
     'x-cursor-streaming': 'true',
     'connect-protocol-version': '1',
