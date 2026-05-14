@@ -30,7 +30,12 @@ if (BRIDGE_PROTOCOL === 'h1') {
 
 const CHANNEL_ID = process.env.RATLC_CHANNEL_ID || 'ch-?';
 const MODEL = process.env.RATLC_MODEL || 'claude-opus-4-7-thinking-max-fast';
-console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL}`);
+// POOL_CONTEXT_MODE drives the priming prompt: in `full` mode the channel
+// is told each bajie_yield carries the entire conversation history; in
+// `last` mode (default) it's told each yield is the next user message
+// verbatim — the historical behavior.
+const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
+console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL} ctxMode=${POOL_CONTEXT_MODE}`);
 const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '500', 10);
 const OPEN_RETRY_MS = parseInt(process.env.RATLC_OPEN_RETRY_MS || '300', 10);
 // When true, native Cursor tool calls (shellArgs/readArgs/writeArgs/...)
@@ -101,7 +106,18 @@ function buildPrimingPrompt(system, callerTools) {
   // (Shell, Read, Write, Grep, ...) that get auto-injected alongside ours.
   lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND any Cursor-native built-ins (such as Shell/Read/Write/Grep/Glob/WebFetch/etc.) that may be present.');
   lines.push(`At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`);
-  lines.push('The bajie_yield tool result is the next user message verbatim.');
+  if (POOL_CONTEXT_MODE === 'full') {
+    // Full-context mode: each bajie_yield result carries the entire
+    // conversation history for one self-contained request. The pool
+    // does NOT preserve continuity across yields, so the model must
+    // treat every delivery as an independent question whose only
+    // context is what appears between the FULL CONVERSATION CONTEXT
+    // delimiters.
+    lines.push('Each `bajie_yield` tool result is the COMPLETE conversation context for ONE self-contained request, formatted with explicit delimiters (look for `=== FULL CONVERSATION CONTEXT ===`, `--- SYSTEM ---`, `--- CONVERSATION ---`, and `[user] (RESPOND TO THIS):`).');
+    lines.push('Treat each `bajie_yield` delivery as INDEPENDENT. Do NOT assume any continuity with prior `bajie_yield` results. The only context you have is what is contained in the latest delivery. Respond only to the final user turn marked `(RESPOND TO THIS)`. Tool_use / tool_result blocks in the rendered history are PAST events — do not re-execute them.');
+  } else {
+    lines.push('The bajie_yield tool result is the next user message verbatim.');
+  }
   lines.push('Never end your turn without calling bajie_yield. Never produce text outside of a normal response.');
   if (system) {
     lines.push(`Caller system context:\n---\n${typeof system === 'string' ? system : JSON.stringify(system)}\n---`);

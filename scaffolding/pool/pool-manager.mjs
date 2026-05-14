@@ -32,6 +32,14 @@ if (!['h1', 'h2'].includes(POOL_BRIDGE_PROTOCOL)) {
   console.error(`invalid POOL_BRIDGE_PROTOCOL=${POOL_BRIDGE_PROTOCOL} (must be h1|h2)`);
   process.exit(1);
 }
+// POOL_CONTEXT_MODE — see api-server.mjs / bridge-worker.mjs for semantics.
+// Propagated to every forked worker so the priming prompt matches what
+// api-server actually sends each turn.
+const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
+if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
+  console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last)`);
+  process.exit(1);
+}
 // How many channels are allowed to run the retry lottery concurrently.
 // Default 1 (sequential, safe against rate-limit). Set higher to bring the
 // pool up faster at risk of tripping ERROR_PRO_USER_RATE_LIMIT_EXCEEDED.
@@ -133,6 +141,9 @@ function spawnChannel() {
     RATLC_MODEL: POOL_MODEL,
     // Propagate the bridge transport choice to each worker.
     BRIDGE_PROTOCOL: POOL_BRIDGE_PROTOCOL,
+    // Propagate the context-rendering mode so the worker's priming prompt
+    // matches the shape of the prompts api-server will deliver each turn.
+    POOL_CONTEXT_MODE,
     // In translate mode, the worker tells startConversation to passthrough
     // native Cursor tools (Shell/Read/Write/Grep/Fetch) as MCP-shape
     // tool_use events with Anthropic names (Bash/Read/Write/Grep/WebFetch).
@@ -583,6 +594,7 @@ function statusSnapshot() {
       model: POOL_MODEL,
       toolMode: POOL_TOOL_MODE,
       bridgeProtocol: POOL_BRIDGE_PROTOCOL,
+      contextMode: POOL_CONTEXT_MODE,
       concurrentOpens: POOL_CONCURRENT_OPENS,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
@@ -620,7 +632,7 @@ const server = net.createServer((socket) => {
   });
 });
 server.listen(POOL_SOCK, () => {
-  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}, protocol=${POOL_BRIDGE_PROTOCOL}`);
+  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}, protocol=${POOL_BRIDGE_PROTOCOL}, contextMode=${POOL_CONTEXT_MODE}`);
 });
 
 // ── Spawn initial pool, honoring POOL_CONCURRENT_OPENS ───────────────────
