@@ -27,7 +27,7 @@
 // "X unavailable" or falling back to Bash heredocs.
 
 const API = process.env.API_URL || 'http://127.0.0.1:4242';
-const STEP_TIMEOUT_MS = parseInt(process.env.TOOL_COVERAGE_STEP_TIMEOUT_MS || '60000', 10);
+const STEP_TIMEOUT_MS = parseInt(process.env.TOOL_COVERAGE_STEP_TIMEOUT_MS || '120000', 10);
 
 const claudeCodeTools = [
   {
@@ -162,6 +162,29 @@ async function checkAlive() {
   } catch { return false; }
 }
 
+// Close any tool_uses left dangling by a step: send back a synthetic
+// tool_result for each so the underlying pool channel goes back to ready
+// rather than staying busy until next idle-ping. Best-effort — failures
+// are logged but don't fail the test.
+async function closeToolUses(originalPrompt, tools, toolUses) {
+  if (!toolUses || toolUses.length === 0) return;
+  try {
+    await postSSE({
+      model: 'claude-opus-4-7-thinking-max-fast',
+      max_tokens: 256,
+      stream: true,
+      messages: [
+        { role: 'user', content: originalPrompt },
+        { role: 'assistant', content: toolUses.map((t) => ({ type: 'tool_use', id: t.id, name: t.name, input: t.input })) },
+        { role: 'user', content: toolUses.map((t) => ({ type: 'tool_result', tool_use_id: t.id, content: '[ok]' })) },
+      ],
+      tools,
+    });
+  } catch (e) {
+    // Channels left busy will time out via idle ping; not fatal here.
+  }
+}
+
 (async () => {
   if (!(await checkAlive())) {
     console.log(`No pool reachable at ${API}/health — skipping live tool-coverage test.`);
@@ -201,54 +224,47 @@ async function checkAlive() {
 
   step('model calls Edit (the Anthropic name) directly when asked');
   {
-    // Use a minimal toolset with just Edit so the model isn't tempted to
-    // start with Read. With Cursor's native StrReplace also available, the
-    // model can route through either path; we only require that the client
-    // ultimately sees name="Edit" with the claude-code arg shape.
+    const editTools = [
+      {
+        name: 'Edit',
+        description: 'Find-and-replace edit on a file. Args: file_path, old_string, new_string.',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } },
+          required: ['file_path', 'old_string', 'new_string'],
+        },
+      },
+    ];
+    const prompt = 'Change the text "foo" to "bar" in /tmp/cov-edit.txt using the Edit tool. ' +
+      'The file already exists and contains "foo". Call Edit directly with ' +
+      'file_path="/tmp/cov-edit.txt", old_string="foo", new_string="bar". No need to read first.';
     const events = await postSSE({
       model: 'claude-opus-4-7-thinking-max-fast',
       max_tokens: 1024,
       stream: true,
-      messages: [{
-        role: 'user',
-        content: 'Change the text "foo" to "bar" in /tmp/cov-edit.txt using the Edit tool. ' +
-          'The file already exists and contains "foo". Call Edit directly with ' +
-          'file_path="/tmp/cov-edit.txt", old_string="foo", new_string="bar". No need to read first.',
-      }],
-      tools: [
-        {
-          name: 'Edit',
-          description: 'Find-and-replace edit on a file. Args: file_path, old_string, new_string.',
-          input_schema: {
-            type: 'object',
-            properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } },
-            required: ['file_path', 'old_string', 'new_string'],
-          },
-        },
-      ],
+      messages: [{ role: 'user', content: prompt }],
+      tools: editTools,
     });
     const tu = extractToolUses(events);
     console.log(`  emitted: ${tu.map((t) => `${t.name}(${JSON.stringify(t.input).slice(0, 60)})`).join(', ') || '(no tool)'}`);
-    // Accept either name=Edit (our MCP tool) OR name=Edit translated from
-    // Cursor's StrReplace. Either way the client sees "Edit".
     const editCall = tu.find((t) => t.name === 'Edit');
     assert(!!editCall, 'tool_use(name="Edit") emitted');
     if (editCall) {
       const hasShape = editCall.input?.file_path && editCall.input?.old_string && editCall.input?.new_string;
       assert(!!hasShape, `Edit input has file_path/old_string/new_string (got keys: ${Object.keys(editCall.input || {}).join(',')})`);
     }
+    // Close out the round-trip so the underlying channel returns to ready.
+    await closeToolUses(prompt, editTools, tu);
   }
 
   step('Bash round-trip works (pwd → response)');
   {
+    const prompt = 'Use Bash to run "pwd" and tell me my current directory in one sentence.';
     const events = await postSSE({
       model: 'claude-opus-4-7-thinking-max-fast',
       max_tokens: 1024,
       stream: true,
-      messages: [{
-        role: 'user',
-        content: 'Use Bash to run "pwd" and tell me my current directory in one sentence.',
-      }],
+      messages: [{ role: 'user', content: prompt }],
       tools: claudeCodeTools,
     });
     const tu = extractToolUses(events);
@@ -256,36 +272,34 @@ async function checkAlive() {
     assert(!!bash, 'tool_use(name="Bash") emitted');
     assert(typeof bash?.input?.command === 'string' && bash.input.command.length > 0,
       `Bash.command is a non-empty string (got "${bash?.input?.command}")`);
+    await closeToolUses(prompt, claudeCodeTools, tu);
   }
 
   step('Read round-trip works');
   {
+    const prompt = 'Use the Read tool to read /tmp/does-not-matter-just-call-it.txt — just call Read once.';
     const events = await postSSE({
       model: 'claude-opus-4-7-thinking-max-fast',
       max_tokens: 1024,
       stream: true,
-      messages: [{
-        role: 'user',
-        content: 'Use the Read tool to read /tmp/does-not-matter-just-call-it.txt — just call Read once.',
-      }],
+      messages: [{ role: 'user', content: prompt }],
       tools: claudeCodeTools,
     });
     const tu = extractToolUses(events);
     const read = tu.find((t) => t.name === 'Read');
     assert(!!read, 'tool_use(name="Read") emitted');
     assert(typeof read?.input?.file_path === 'string', `Read.file_path is a string`);
+    await closeToolUses(prompt, claudeCodeTools, tu);
   }
 
   step('Grep round-trip works');
   {
+    const prompt = 'Use the Grep tool to search for "TODO" in /tmp. Just call Grep once with pattern="TODO" path="/tmp".';
     const events = await postSSE({
       model: 'claude-opus-4-7-thinking-max-fast',
       max_tokens: 1024,
       stream: true,
-      messages: [{
-        role: 'user',
-        content: 'Use the Grep tool to search for "TODO" in /tmp. Just call Grep once with pattern="TODO" path="/tmp".',
-      }],
+      messages: [{ role: 'user', content: prompt }],
       tools: claudeCodeTools,
     });
     const tu = extractToolUses(events);
@@ -293,6 +307,7 @@ async function checkAlive() {
     assert(!!grep, 'tool_use(name="Grep") emitted');
     assert(typeof grep?.input?.pattern === 'string' && grep.input.pattern.length > 0,
       `Grep.pattern is a non-empty string`);
+    await closeToolUses(prompt, claudeCodeTools, tu);
   }
 
   step('Glob round-trip works');
@@ -303,31 +318,28 @@ async function checkAlive() {
     // available because it can match the request with a single call. We
     // accept Glob / mcp_Glob (the primary path) OR Grep with a glob field
     // (the substitution path — also a useful pattern from claude-code's POV).
+    const globTools = [
+      {
+        name: 'Glob',
+        description: 'Find files by glob pattern.',
+        input_schema: {
+          type: 'object',
+          properties: { pattern: { type: 'string' } },
+          required: ['pattern'],
+        },
+      },
+    ];
+    const prompt = 'Use the Glob tool to find all .txt files under /tmp. Call Glob with pattern="/tmp/*.txt". Just one call.';
     const events = await postSSE({
       model: 'claude-opus-4-7-thinking-max-fast',
       max_tokens: 1024,
       stream: true,
-      messages: [{
-        role: 'user',
-        content: 'Use the Glob tool to find all .txt files under /tmp. Call Glob with pattern="/tmp/*.txt". Just one call.',
-      }],
-      tools: [
-        {
-          name: 'Glob',
-          description: 'Find files by glob pattern.',
-          input_schema: {
-            type: 'object',
-            properties: { pattern: { type: 'string' } },
-            required: ['pattern'],
-          },
-        },
-      ],
+      messages: [{ role: 'user', content: prompt }],
+      tools: globTools,
     });
     const tu = extractToolUses(events);
     const glob = tu.find((t) => t.name === 'Glob' || t.name === 'mcp_Glob');
     const grepWithGlob = tu.find((t) => t.name === 'Grep' && (t.input?.glob || /\*/.test(t.input?.pattern || '')));
-    // Look for "unavailable" text in the model's response — THAT is the
-    // user's actual failure mode.
     const text = extractText(events);
     const sayUnavailable = /unavailable|not available|cannot use|don't have access/i.test(text);
     assert(!sayUnavailable, `no "unavailable" hallucination (text="${text.slice(0, 100)}")`);
@@ -338,6 +350,7 @@ async function checkAlive() {
     } else {
       fail(`expected Glob or Grep-with-glob (got: ${tu.map((t) => `${t.name}(${JSON.stringify(t.input).slice(0, 60)})`).join(',') || 'none'})`);
     }
+    await closeToolUses(prompt, globTools, tu);
   }
 
   step('Write round-trip works (or Read-first safety check)');
@@ -345,14 +358,12 @@ async function checkAlive() {
     // claude-code's training defaults to Read-before-Write for safety. In
     // translate mode the model has access to both, so it will often Read
     // first. The bar is: round-trip alive, no "unavailable" hallucination.
+    const prompt = 'Create a new file at /tmp/cov-write.txt with content "hello world". Use the Write tool with file_path=/tmp/cov-write.txt content="hello world".';
     const events = await postSSE({
       model: 'claude-opus-4-7-thinking-max-fast',
       max_tokens: 1024,
       stream: true,
-      messages: [{
-        role: 'user',
-        content: 'Create a new file at /tmp/cov-write.txt with content "hello world". Use the Write tool with file_path=/tmp/cov-write.txt content="hello world".',
-      }],
+      messages: [{ role: 'user', content: prompt }],
       tools: claudeCodeTools,
     });
     const tu = extractToolUses(events);
@@ -363,6 +374,7 @@ async function checkAlive() {
     assert(!sayUnavailable, `no "unavailable" hallucination on Write request (text="${text.slice(0, 100)}")`);
     assert(!!write || !!read,
       `tool_use(name="Write" or "Read") emitted (got: ${tu.map((t) => t.name).join(',') || 'none'})`);
+    await closeToolUses(prompt, claudeCodeTools, tu);
   }
 
   console.log('');
