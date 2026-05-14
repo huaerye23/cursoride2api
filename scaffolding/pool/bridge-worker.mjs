@@ -154,6 +154,9 @@ function openOnce(initialPrompt, allTools) {
           try { b.sendToolResult(info.id, info.execId, { error: 'tool not available during priming' }); } catch { /* ignore */ }
         }
       },
+      // During the priming pass the model emits thinking too, but no
+      // currentRequestId exists yet — drop those frames silently. The
+      // live-callbacks attachment below is where forwarding kicks in.
       onThinkingDelta: () => {},
       onStepCompleted: () => {},
       onTurnEnded: () => { if (!yieldInfo) resolve({ kind: 'no_yield', textBuf }); },
@@ -224,7 +227,21 @@ function attachLiveCallbacks() {
       lastActivityAt = Date.now();
       send({ type: 'text_delta', channelId: CHANNEL_ID, requestId: currentRequestId, text: t });
     },
-    onThinkingDelta: () => {},
+    // Forward thinking deltas via IPC so pool-manager + api-server can
+    // buffer them for proxy-side re-injection on subsequent turns
+    // (mirrors src/thinking-history.js + CURSOR_REINJECT_THINKING in
+    // server.js). Capture is unconditional at the wire — the api-server
+    // decides whether to keep the data based on POOL_REINJECT_THINKING.
+    // We deliberately do NOT emit thinking to the client SSE here: the
+    // signed thinking-block round-trip is not portable across providers,
+    // and proxy-internal text-form re-injection is the only useful path
+    // (see DEVLOG: "Conversation key collision" / `_emitThinkingBlocks=false`).
+    onThinkingDelta: (text) => {
+      if (currentRequestId == null) return;
+      if (!text) return;
+      lastActivityAt = Date.now();
+      send({ type: 'thinking_delta', channelId: CHANNEL_ID, requestId: currentRequestId, text });
+    },
     onMcpCall: (info) => {
       lastActivityAt = Date.now();
       if (info.toolName === YIELD_TOOL_NAME) {
