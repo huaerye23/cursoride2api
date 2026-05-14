@@ -164,6 +164,12 @@ ratlc claude --model claude-4.6-sonnet-medium-fast
 
 - `ratlc status` adds a `GROUP` column on the per-channel table and a
   per-group summary above the table.
+- `ratlc tui` (both the `1:split` and `4:status` views): when more than
+  one group is registered, the header line shows `groups=N (default=X)`
+  in place of the single-model line, a per-group summary table sits
+  above the channel table, and the channel table is **sectioned by
+  group** with one `── <model> ──` separator per group. Single-group
+  setups render unchanged.
 - `/health` returns `pool.groups[]` (per-group ready/busy/opening/dead
   counts + targets).
 - `/metrics` emits `ratlc_group_channels{group="...",state="..."}`

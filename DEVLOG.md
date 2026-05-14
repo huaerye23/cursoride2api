@@ -1520,6 +1520,16 @@ view gains a `GROUP` column on the channel table and a per-group
 summary block above it; the `:`-bar accepts `:add-group`,
 `:remove-group`, `:groups`, `:ramp ±N` (default group).
 
+**TUI per-group sectioning (commit `a63a784`).** Initial multi-group
+TUI work surfaced the breakdown only in `4:status`; the more commonly
+used `1:split` view kept a single-model header and a flat channel
+table. `buildStatusLines` (the shared renderer for both views) now
+gates on `pool.groups.length > 1`: in multi-group mode it switches
+the header line to `groups=N (default=X)`, prepends a Groups summary
+table (`GROUP | TARGET | READY | BUSY | OPEN | DEAD | ROUNDS`), and
+sections the channel table with `── <model> (default) ──` separators
+between per-group blocks. Single-group setups render unchanged.
+
 See `scaffolding/pool/MULTI_GROUP_PLAN.md` § 13 for the decision log
 of the 5 design questions resolved along the way.
 
