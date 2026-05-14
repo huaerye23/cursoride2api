@@ -24,7 +24,62 @@ const __dirname = path.dirname(__filename);
 
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '2', 10);
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
-const POOL_MODEL = process.env.POOL_MODEL || 'claude-opus-4-7-thinking-max-fast';
+// POOL_MODEL accepts two forms:
+//   1. Single model name (legacy):    POOL_MODEL=claude-opus-4-7-thinking-max-fast
+//      → Sized by POOL_SIZE. The first entry is always the DEFAULT group.
+//   2. CSV form:                       POOL_MODEL=opus,haiku:3
+//                                      POOL_MODEL=opus:5,haiku:3,composer-2-fast:1
+//      → First entry is the default group. Each entry is `model` (using
+//        POOL_SIZE) or `model:size` (explicit per-group size). Subsequent
+//        entries become additional groups, mirroring POOL_GROUPS semantics.
+//
+// Both forms work in combination with POOL_GROUPS — entries from POOL_GROUPS
+// are merged in the same way (add to existing group's targetSize, or create
+// new group), so `POOL_MODEL=opus,haiku:3` is equivalent to
+// `POOL_MODEL=opus POOL_GROUPS=haiku:3`.
+const POOL_MODEL_RAW = process.env.POOL_MODEL || 'claude-opus-4-7-thinking-max-fast';
+// parsePoolModelEnv: returns [{model, size}, ...] in declaration order. First
+// entry is the default group. `size` is null when not explicitly given —
+// callers default to POOL_SIZE for the default group, or treat it as a soft
+// add-to-existing for later groups.
+function parsePoolModelEnv(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return [];
+  const out = [];
+  for (const piece of trimmed.split(',')) {
+    const s = piece.trim();
+    if (!s) continue;
+    // Accept either "model" or "model:N" (N must be a non-negative int).
+    const colonIdx = s.lastIndexOf(':');
+    let model, size;
+    if (colonIdx === -1) {
+      model = s;
+      size = null;
+    } else {
+      const sizeStr = s.slice(colonIdx + 1).trim();
+      const sizeNum = parseInt(sizeStr, 10);
+      if (/^\d+$/.test(sizeStr) && Number.isFinite(sizeNum) && sizeNum >= 0) {
+        model = s.slice(0, colonIdx).trim();
+        size = sizeNum;
+      } else {
+        // Treat as a model name that legitimately contains ':' (none of
+        // Cursor's current model ids do, but be permissive).
+        model = s;
+        size = null;
+      }
+    }
+    if (!model) continue;
+    out.push({ model, size });
+  }
+  return out;
+}
+const poolModelEntries = parsePoolModelEnv(POOL_MODEL_RAW);
+if (poolModelEntries.length === 0) {
+  console.error(`invalid POOL_MODEL=${JSON.stringify(POOL_MODEL_RAW)} (parsed zero entries)`);
+  process.exit(1);
+}
+const POOL_MODEL = poolModelEntries[0].model;
+const POOL_MODEL_DEFAULT_SIZE = poolModelEntries[0].size != null ? poolModelEntries[0].size : POOL_SIZE;
 const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);
 const PING_TIMEOUT_MS = parseInt(process.env.PING_TIMEOUT_MS || '45000', 10);
 const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10);
@@ -893,8 +948,28 @@ server.listen(POOL_SOCK, () => {
 });
 
 // ── Bootstrap groups from env ────────────────────────────────────────────
-const defaultGroup = makeGroup(POOL_MODEL, POOL_SIZE, true);
+// Default group: first entry of POOL_MODEL_RAW (CSV form) or the legacy
+// single-value POOL_MODEL. Sized by the entry's explicit size if given,
+// else POOL_SIZE.
+const defaultGroup = makeGroup(POOL_MODEL, POOL_MODEL_DEFAULT_SIZE, true);
 groups.set(POOL_MODEL, defaultGroup);
+
+// CSV-form POOL_MODEL trailing entries — merged the same way as POOL_GROUPS.
+// Entries with no explicit size default to POOL_SIZE (mirrors the default-
+// group fallback).
+for (let i = 1; i < poolModelEntries.length; i++) {
+  const e = poolModelEntries[i];
+  const size = e.size != null ? e.size : POOL_SIZE;
+  if (e.model === POOL_MODEL) {
+    defaultGroup.targetSize += size;
+    continue;
+  }
+  if (groups.has(e.model)) {
+    groups.get(e.model).targetSize += size;
+    continue;
+  }
+  groups.set(e.model, makeGroup(e.model, size, false));
+}
 
 for (const entry of parsePoolGroupsEnv()) {
   if (entry.foldIntoDefault) {
