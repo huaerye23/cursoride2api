@@ -184,31 +184,32 @@ async function openWithRetry(system, callerTools) {
   const primingPrompt = buildPrimingPrompt(system, cTools);
 
   setState('opening');
-  // Both soft "Please wait" and hard RATE_LIMIT_EXCEEDED are real
-  // back-pressure signals from Cursor: when we ignore them and keep firing,
-  // the soft-throttle tightens (88%+ of attempts return "Please wait" after
-  // ~30 min of 300 ms retry pressure). Exponential 5s → 60s gives Cursor
-  // room to relax. The reset on unpaid_invoice / no_yield is the critical
-  // fix vs the pre-tuning code: a transient rate-limit burst can't
-  // permanently park a channel at the 60 s cap, because the probabilistic
-  // gate firing (which means our requests ARE getting through) resets the
-  // backoff to its floor.
-  const RATE_LIMIT_FLOOR_MS = 5000;
-  // 15s cap (was 60s). With sustained rate-limit hits (no unpaid_invoice
-  // between to trigger the reset), the backoff escalates 5→7.5→11→17→25
-  // and tops out at 15s instead of 60s. Channel still makes 1 attempt
-  // every ~15s in the worst case rather than 1/min — keeps the gate
-  // sampling rate high enough that a lucky window is found within
-  // reasonable time. Tune via RATLC_BACKOFF_CEILING_MS.
-  const RATE_LIMIT_CEILING_MS = parseInt(process.env.RATLC_BACKOFF_CEILING_MS || '15000', 10);
-  let rateLimitBackoff = RATE_LIMIT_FLOOR_MS;
+  // AIMD self-tuning wait time. Goal: keep firing at the highest rate
+  // Cursor tolerates without triggering soft rate-limits.
+  //   - Any rate-limit response (soft "Please wait" or hard
+  //     RATE_LIMIT_EXCEEDED) means we were too fast → MULTIPLICATIVE
+  //     INCREASE of wait (x2): sharp back-off.
+  //   - Any other response (unpaid_invoice probabilistic gate, no_yield,
+  //     and would-be 'opened' which exits the loop) means Cursor accepted
+  //     our request → ADDITIVE DECREASE of wait (-50ms): slowly probe a
+  //     faster rate.
+  // The channel converges to a wait that's just below the soft-limit
+  // threshold. Floor 300ms (most aggressive we'll try); ceiling 30s
+  // (slowest we'll go). The reset/escalate dance is no longer needed —
+  // AIMD does both jobs continuously.
+  const WAIT_FLOOR_MS = parseInt(process.env.RATLC_WAIT_FLOOR_MS || '300', 10);
+  const WAIT_CEILING_MS = parseInt(process.env.RATLC_WAIT_CEILING_MS || '30000', 10);
+  const WAIT_DECREASE_MS = parseInt(process.env.RATLC_WAIT_DECREASE_MS || '50', 10);
+  const WAIT_INCREASE_FACTOR = parseFloat(process.env.RATLC_WAIT_INCREASE_FACTOR || '2.0');
+  const INITIAL_WAIT_MS = parseInt(process.env.RATLC_INITIAL_WAIT_MS || '1000', 10);
+  let currentWait = INITIAL_WAIT_MS;
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
     // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
     // activity live. The cost is one ~120-byte IPC message per retry; with
     // POOL_CONCURRENT_OPENS=5 worst-case ~15 msgs/sec, well below anything
     // the pool socket cares about.
-    setState('opening');
+    setState('opening', { waitMs: currentWait });
     const result = await openOnce(primingPrompt, allTools);
     if (result.kind === 'opened') {
       bridge = result.bridge;
@@ -219,29 +220,27 @@ async function openWithRetry(system, callerTools) {
       setState('ready');
       return;
     }
-    if (result.kind === 'unpaid' || result.kind === 'no_yield') {
-      // Probabilistic gate or empty response — our request reached the
-      // backend cleanly, so the system isn't throttling us right now.
-      // Reset the rate-limit backoff to its floor.
-      rateLimitBackoff = RATE_LIMIT_FLOOR_MS;
-      await sleep(jitter(OPEN_RETRY_MS));
-      continue;
+    if (result.kind === 'other_error') {
+      setState('dead', { error: result.msg || result.kind });
+      process.exit(1);
     }
+    // AIMD update:
     if (result.kind === 'rate_limit_soft' || result.kind === 'rate_limit_hard') {
-      // Both kinds are back-pressure signals: share one exponential
-      // backoff so sustained throttling, regardless of variant,
-      // ramps us down. Resets above on the first unpaid/no_yield.
-      const sleepMs = jitter(rateLimitBackoff);
+      const oldWait = currentWait;
+      currentWait = Math.min(WAIT_CEILING_MS, Math.floor(currentWait * WAIT_INCREASE_FACTOR));
       if (result.kind === 'rate_limit_hard') {
-        send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt}, backoff ${sleepMs}ms` });
+        send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt}, wait ${oldWait}→${currentWait}ms` });
       }
-      await sleep(sleepMs);
-      rateLimitBackoff = Math.min(Math.floor(rateLimitBackoff * 1.5), RATE_LIMIT_CEILING_MS);
-      continue;
+    } else {
+      currentWait = Math.max(WAIT_FLOOR_MS, currentWait - WAIT_DECREASE_MS);
     }
-    // other_error — die.
-    setState('dead', { error: result.msg || result.kind });
-    process.exit(1);
+    // Periodic observability: log the AIMD state every 20 attempts so we
+    // can verify channels are converging to a stable wait.
+    if (attempt % 20 === 0) {
+      send({ type: 'log', channelId: CHANNEL_ID, level: 'info', message: `aimd: attempt=${attempt} wait=${currentWait}ms last=${result.kind}` });
+    }
+    await sleep(jitter(currentWait));
+    continue;
   }
   setState('dead', { error: 'open exhausted' });
   process.exit(1);
