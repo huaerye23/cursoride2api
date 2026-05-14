@@ -40,6 +40,14 @@ if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
   console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last)`);
   process.exit(1);
 }
+// POOL_REINJECT_THINKING — opt-in symmetry with CURSOR_REINJECT_THINKING
+// in server.js. Captures thinking_delta events from the bridge per
+// convKey and re-injects them as `<thinking>...</thinking>` text on the
+// next turn. Default OFF (no behavior change). The actual buffering
+// lives in api-server.mjs; pool-manager just forwards the env var to
+// each spawned worker (so bridge-worker doesn't have to read it on
+// its own — the env is already in the process tree).
+const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
 // How many channels are allowed to run the retry lottery concurrently.
 // Default 1 (sequential, safe against rate-limit). Set higher to bring the
 // pool up faster at risk of tripping ERROR_PRO_USER_RATE_LIMIT_EXCEEDED.
@@ -144,6 +152,11 @@ function spawnChannel() {
     // Propagate the context-rendering mode so the worker's priming prompt
     // matches the shape of the prompts api-server will deliver each turn.
     POOL_CONTEXT_MODE,
+    // Propagate the reinject-thinking flag. Workers don't read it
+    // themselves (the buffer lives in api-server), but forwarding via
+    // env keeps the whole process tree on a consistent setting and
+    // makes status snapshots accurate.
+    POOL_REINJECT_THINKING: POOL_REINJECT_THINKING ? '1' : '0',
     // In translate mode, the worker tells startConversation to passthrough
     // native Cursor tools (Shell/Read/Write/Grep/Fetch) as MCP-shape
     // tool_use events with Anthropic names (Bash/Read/Write/Grep/WebFetch).
@@ -238,6 +251,7 @@ function handleWorkerMessage(ch, msg) {
       break;
 
     case 'text_delta':
+    case 'thinking_delta':
     case 'tool_use':
     case 'yield':
     case 'step_completed':
@@ -330,7 +344,11 @@ function forwardToClient(ch, msg) {
     return;
   }
 
-  // text_delta — pass through
+  // text_delta / thinking_delta / step_completed — pass through as-is.
+  // thinking_delta carries the model's emitted reasoning text; api-server
+  // buffers it per-convKey for proxy-side re-injection
+  // (POOL_REINJECT_THINKING). The data is NOT relayed downstream to
+  // claude-code — see api-server.mjs for the policy.
   writeToClient(client, msg);
 }
 
@@ -653,6 +671,7 @@ function statusSnapshot() {
       toolMode: POOL_TOOL_MODE,
       bridgeProtocol: POOL_BRIDGE_PROTOCOL,
       contextMode: POOL_CONTEXT_MODE,
+      reinjectThinking: POOL_REINJECT_THINKING ? 1 : 0,
       concurrentOpens: POOL_CONCURRENT_OPENS,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
@@ -690,7 +709,7 @@ const server = net.createServer((socket) => {
   });
 });
 server.listen(POOL_SOCK, () => {
-  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}, protocol=${POOL_BRIDGE_PROTOCOL}, contextMode=${POOL_CONTEXT_MODE}`);
+  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}, protocol=${POOL_BRIDGE_PROTOCOL}, contextMode=${POOL_CONTEXT_MODE}, reinjectThinking=${POOL_REINJECT_THINKING ? 1 : 0}`);
 });
 
 // ── Spawn initial pool, honoring POOL_CONCURRENT_OPENS ───────────────────

@@ -7,13 +7,27 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
+import * as thinkingBuffer from './thinking-buffer.mjs';
+
+// Bridge to the existing CommonJS anthropic-tools helpers so we can reuse
+// `deriveConversationKey` and `extractClientSessionId` instead of porting
+// them. The helpers depend on Node `crypto` only — no ESM coupling.
+const _require = createRequire(import.meta.url);
+const anthropicTools = _require('../../src/anthropic-tools.js');
 
 const PORT = parseInt(process.env.PORT || '4242', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
+// POOL_REINJECT_THINKING — opt-in symmetry with CURSOR_REINJECT_THINKING.
+// When set, every thinking_delta arriving from the pool is appended to a
+// per-convKey buffer; on subsequent turns the captured text is rendered
+// back into the outbound prompt as `<thinking>...</thinking>` blocks.
+// Default OFF (no behavior change vs. legacy). See thinking-buffer.mjs.
+const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
 // POOL_CONTEXT_MODE selects how multi-turn conversations are forwarded
 // to the pool channel:
 //   last (default) — only the last user message text is sent. Backwards-
@@ -32,7 +46,7 @@ if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
 }
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
-log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}`);
+log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}`);
 
 // ── Pool socket connection ──────────────────────────────────────────────
 let poolSock = null;
@@ -168,7 +182,14 @@ function renderContentBlocks(blocks) {
 //   - End with the latest user turn marked as the one to respond to
 //   - Stable across content-shape variations (string vs array, nested
 //     tool_result.content of either shape)
-function renderFullContext({ messages, system, tools }) {
+//
+// When `thinkingTurns` is provided (POOL_REINJECT_THINKING=1), each entry
+// `{turnIndex, text}` is keyed to the assistant message at that ordinal
+// (0-indexed by assistant role appearances in messages[]). We prepend
+// `<thinking>...</thinking>` to that turn's body so the model can
+// reference its own prior reasoning in the next turn. Mirrors
+// src/anthropic-converter.js:499-518 (server.js's converter).
+function renderFullContext({ messages, system, tools, thinkingTurns }) {
   const lines = [];
   lines.push('=== FULL CONVERSATION CONTEXT ===');
   lines.push('You are receiving the complete conversation history for ONE self-contained request. Respond to the FINAL user turn below. Do not assume any continuity with prior bajie_yield results — each delivery is independent and the history below is the only context you have.');
@@ -191,17 +212,36 @@ function renderFullContext({ messages, system, tools }) {
     lines.push('');
   }
 
+  // Build a per-assistant-turn-ordinal lookup so we can attach captured
+  // thinking text to the matching assistant message in messages[].
+  const thinkingByAssistantIdx = new Map();
+  if (Array.isArray(thinkingTurns)) {
+    for (const e of thinkingTurns) {
+      if (e && Number.isFinite(e.turnIndex) && typeof e.text === 'string' && e.text.length > 0) {
+        thinkingByAssistantIdx.set(e.turnIndex, e.text);
+      }
+    }
+  }
+
   lines.push('--- CONVERSATION ---');
   const arr = Array.isArray(messages) ? messages : [];
+  let assistantIdx = -1;
   for (let i = 0; i < arr.length; i++) {
     const m = arr[i];
     if (!m || !m.role) continue;
     const isLastUser = (i === arr.length - 1) && m.role === 'user';
     const tag = isLastUser ? `[user] (RESPOND TO THIS)` : `[${m.role}]`;
     lines.push(tag + ':');
-    const body = typeof m.content === 'string'
+    let body = typeof m.content === 'string'
       ? m.content
       : renderContentBlocks(m.content);
+    if (m.role === 'assistant') {
+      assistantIdx++;
+      const priorThinking = thinkingByAssistantIdx.get(assistantIdx);
+      if (priorThinking) {
+        body = `<thinking>\n${priorThinking}\n</thinking>\n${body || ''}`;
+      }
+    }
     lines.push(body || '(empty)');
     lines.push('');
   }
@@ -209,6 +249,19 @@ function renderFullContext({ messages, system, tools }) {
   lines.push('--- END CONVERSATION ---');
   lines.push('Respond to the final user turn now. Then call bajie_yield to wait for the next request.');
   return lines.join('\n');
+}
+
+// Render a stack of captured thinking turns as a leading sequence of
+// `<thinking>...</thinking>` blocks, oldest-first. Used in `last`-mode
+// re-injection: we have only the latest user text to send, so the stored
+// thinking history goes in front of it. Returns '' when no turns.
+function renderThinkingPreamble(thinkingTurns) {
+  if (!Array.isArray(thinkingTurns) || thinkingTurns.length === 0) return '';
+  const blocks = thinkingTurns
+    .filter((e) => e && typeof e.text === 'string' && e.text.length > 0)
+    .map((e) => `<thinking>\n${e.text}\n</thinking>`);
+  if (blocks.length === 0) return '';
+  return blocks.join('\n\n') + '\n\n';
 }
 
 async function handleMessagesRequest(req, res) {
@@ -251,6 +304,23 @@ async function handleMessagesRequest(req, res) {
   if (lastMsg.role !== 'user') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'last message must be user' } }));
+  }
+
+  // Derive convKey for the thinking-buffer (and any future per-conv
+  // state). Prefer the claude-code session UUID — it's stable across
+  // continuations of one CLI invocation and cannot collide across
+  // distinct sessions on the same machine. Falls back to the legacy
+  // (modelId, system, first-user-text, remoteAddr, remotePort, tools)
+  // salt when the header / body.metadata.user_id are absent.
+  req.body = body; // expose for extractClientSessionId's body-fallback path
+  const clientSessionId = anthropicTools.extractClientSessionId(req);
+  const convKey = anthropicTools.deriveConversationKey(
+    messages, model, system, tools,
+    req.socket?.remoteAddress, req.socket?.remotePort,
+    clientSessionId,
+  );
+  if (POOL_REINJECT_THINKING) {
+    log(`  convKey=${convKey} clientSessionId=${clientSessionId ? clientSessionId.slice(0, 8) + '…' : '(none)'}`);
   }
 
   // Decide what to send: tool_result(s) or user message.
@@ -367,6 +437,13 @@ async function handleMessagesRequest(req, res) {
     if (done) return;
     done = true;
     stopTextBlock();
+    // Commit any accumulated thinking text into a stored turn under this
+    // convKey BEFORE emitting message_stop. Each /v1/messages POST maps
+    // to exactly one assistant message in the client's messages[]
+    // history, so one commit per finishMessage is correct (regardless of
+    // whether stopReason was end_turn or tool_use). Mirrors server.js's
+    // onTurnEnded → thinkingHistory.recordTurnThinking path.
+    if (POOL_REINJECT_THINKING) thinkingBuffer.commitTurn(convKey);
     sseWrite(res, 'message_delta', {
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
@@ -389,6 +466,13 @@ async function handleMessagesRequest(req, res) {
     onEvent: (msg) => {
       if (msg.type === 'text_delta') {
         emitTextDelta(msg.text);
+      } else if (msg.type === 'thinking_delta') {
+        // Capture thinking text into the per-convKey buffer for re-injection
+        // on the NEXT turn. Do NOT forward to the client SSE — Anthropic's
+        // signed thinking blocks need a signature we can't produce, and
+        // emitting unsigned blocks poisons claude-code's session against
+        // direct-Anthropic resume (see DEVLOG re `_emitThinkingBlocks=false`).
+        if (POOL_REINJECT_THINKING) thinkingBuffer.append(convKey, msg.text || '');
       } else if (msg.type === 'tool_use') {
         // Parallel-tool-calls fix: emit the tool_use block but DO NOT finish
         // the message here. The model may emit several tool_uses in a single
@@ -490,10 +574,22 @@ async function handleMessagesRequest(req, res) {
     // one self-contained prompt; in `last` mode (default, backwards-
     // compatible), forward only the last user message text. The pool
     // socket frame is identical in both — only the `text` payload changes.
-    const text = POOL_CONTEXT_MODE === 'full'
-      ? renderFullContext({ messages, system, tools })
-      : extractTextFromContent(lastMsg.content);
-    log(`  → pool send_user_message requestId=${requestId} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length}`);
+    //
+    // POOL_REINJECT_THINKING: in `full` mode the captured thinking turns
+    // are attached to their matching assistant messages inside the
+    // rendered history. In `last` mode the captured turns are prepended
+    // to the user-message text as a leading sequence of `<thinking>`
+    // blocks, since there's no history to attach to.
+    const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+    let text;
+    if (POOL_CONTEXT_MODE === 'full') {
+      text = renderFullContext({ messages, system, tools, thinkingTurns });
+    } else {
+      const userText = extractTextFromContent(lastMsg.content);
+      const preamble = renderThinkingPreamble(thinkingTurns);
+      text = preamble + userText;
+    }
+    log(`  → pool send_user_message requestId=${requestId} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
     poolWrite({
       type: 'request', requestId, action: 'send_user_message',
       text,
@@ -570,6 +666,89 @@ function handleMetrics(req, res) {
   sock.on('error', (e) => { clearTimeout(t); if (!res.writableEnded) { res.writeHead(503); res.end(`pool socket error: ${e.message}`); } });
 }
 
+// Debug endpoint: dump the in-process thinking buffer. Used by
+// scaffolding/pool/reinject-thinking-test.mjs to verify capture without
+// having to grep truncated logs. Off-by-default — only enabled when
+// POOL_REINJECT_THINKING_DEBUG=1.
+//   GET /v1/_debug/thinking_buffer        → all keys + sizes
+//   GET /v1/_debug/thinking_buffer?convKey=XXXXXXXXXXXXXXXX
+//                                          → the stored turns for one key
+function handleThinkingBufferDebug(req, res) {
+  if (process.env.POOL_REINJECT_THINKING_DEBUG !== '1') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+    return;
+  }
+  const url = new URL(req.url, 'http://localhost');
+  const convKey = url.searchParams.get('convKey');
+  if (convKey) {
+    const turns = thinkingBuffer.getForConvKey(convKey);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      enabled: thinkingBuffer.isEnabled(),
+      convKey,
+      turns,
+      turnCount: turns.length,
+    }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    enabled: thinkingBuffer.isEnabled(),
+    maxBytesPerTurn: thinkingBuffer.maxBytesPerTurn(),
+    maxTurns: thinkingBuffer.maxTurns(),
+    size: thinkingBuffer.size(),
+  }));
+}
+
+// Debug endpoint: render the outbound prompt text for a given (synthetic)
+// message body without actually sending it to the pool. Lets the E2E
+// test verify the `<thinking>` block placement in the rendered prompt.
+//   POST /v1/_debug/render  body = { messages, system, tools, model, convKey? }
+function handleRenderDebug(req, res) {
+  if (process.env.POOL_REINJECT_THINKING_DEBUG !== '1') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+    return;
+  }
+  (async () => {
+    let body;
+    try { body = await readJsonBody(req); }
+    catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'bad json' }));
+    }
+    const { messages, system, tools, model, convKey: convKeyOverride, mode: modeOverride } = body || {};
+    let convKey = convKeyOverride;
+    if (!convKey) {
+      req.body = body;
+      const sid = anthropicTools.extractClientSessionId(req);
+      convKey = anthropicTools.deriveConversationKey(
+        messages || [], model, system, tools,
+        req.socket?.remoteAddress, req.socket?.remotePort, sid,
+      );
+    }
+    const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+    const mode = (modeOverride === 'last' || modeOverride === 'full') ? modeOverride : POOL_CONTEXT_MODE;
+    let rendered;
+    if (mode === 'full') {
+      rendered = renderFullContext({ messages: messages || [], system, tools, thinkingTurns });
+    } else {
+      const lastMsg = (messages || []).slice(-1)[0];
+      const userText = lastMsg ? extractTextFromContent(lastMsg.content) : '';
+      rendered = renderThinkingPreamble(thinkingTurns) + userText;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      enabled: POOL_REINJECT_THINKING,
+      mode,
+      convKey,
+      thinkingTurnCount: thinkingTurns.length,
+      rendered,
+    }));
+  })();
+}
+
 function handleHealth(req, res) {
   // Open a one-shot socket to the pool — keeps administrative requests
   // off the main streaming socket.
@@ -612,6 +791,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return handleModels(req, res);
   if (req.method === 'GET' && path === '/health') return handleHealth(req, res);
   if (req.method === 'GET' && path === '/metrics') return handleMetrics(req, res);
+  if (req.method === 'GET' && path === '/v1/_debug/thinking_buffer') return handleThinkingBufferDebug(req, res);
+  if (req.method === 'POST' && path === '/v1/_debug/render') return handleRenderDebug(req, res);
   if (req.method === 'HEAD') { res.writeHead(200); return res.end(); }
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));

@@ -365,6 +365,44 @@ function _toolListHash(tools) {
 }
 
 /**
+ * Pull the stable per-claude-code-session identifier out of an incoming
+ * /v1/messages request. Claude Code emits a UUID v4 in the
+ * `x-claude-code-session-id` header on every POST of a single session
+ * (a single `claude` CLI invocation). It also embeds the same UUID inside
+ * `body.metadata.user_id` (which is itself a stringified-JSON or plain
+ * object containing `{device_id, account_uuid, session_id}`).
+ *
+ * Returns the UUID string when present, or `null` otherwise. Caller
+ * decides how to use it (e.g., as a bulletproof salt component for the
+ * conversation key).
+ */
+function extractClientSessionId(req) {
+  if (!req) return null;
+  try {
+    const hdr = req.headers && (req.headers['x-claude-code-session-id'] || req.headers['X-Claude-Code-Session-Id']);
+    if (typeof hdr === 'string' && hdr.length > 0) return hdr;
+  } catch { /* ignore */ }
+  // Fallback: body.metadata.user_id. Some clients pass a JSON-encoded
+  // string; others pass a plain object. Try both shapes.
+  try {
+    const body = req.body || (req._parsedBody) || null;
+    if (body && body.metadata && body.metadata.user_id != null) {
+      let meta = body.metadata.user_id;
+      if (typeof meta === 'string') {
+        try { meta = JSON.parse(meta); } catch { /* leave as string */ }
+      }
+      if (meta && typeof meta === 'object' && typeof meta.session_id === 'string' && meta.session_id) {
+        return meta.session_id;
+      }
+      if (typeof meta === 'string' && meta) {
+        return meta;
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/**
  * Stable conversation hash — used as cache key for opaque conversation
  * checkpoint state.
  *
@@ -379,8 +417,23 @@ function _toolListHash(tools) {
  *                       single keep-alive socket; two concurrent
  *                       processes get distinct ports)
  *   - tool-list hash  — different tool sets diverge automatically
+ *
+ * When `clientSessionId` is provided (extracted from the
+ * `x-claude-code-session-id` header or `body.metadata.user_id`), we emit
+ * a "conv-v2:" hash that depends on only `(modelId, clientSessionId)`.
+ * Both fields are stable across continuations of one CLI session and
+ * cannot collide across distinct sessions on the same machine, which
+ * removes the "two claude-code processes happen to share remoteAddr +
+ * first user text + tool list" failure mode of the legacy salt.
  */
-function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort) {
+function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort, clientSessionId) {
+  if (clientSessionId) {
+    return crypto
+      .createHash('sha256')
+      .update('conv-v2:' + (modelId || '') + ':' + clientSessionId)
+      .digest('hex')
+      .slice(0, 16);
+  }
   const first = extractFirstUserText(messages).slice(0, 200);
   const sys = _systemFingerprint(system);
   const addr = remoteAddr || '';
@@ -604,6 +657,7 @@ module.exports = {
   findLatestUserMessage, extractFirstUserText,
   deriveConversationKey, deriveBridgeKey,
   deterministicConversationId,
+  extractClientSessionId,
   hasToolResults,
   parseHallucinatedToolCalls, canonicalizeHallucinatedToolName,
   normalizeHallucinatedToolArgs,
