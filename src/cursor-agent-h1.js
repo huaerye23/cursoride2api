@@ -307,18 +307,31 @@ function startConversation(token, options = {}) {
       const res = await fetch(url, { method: 'POST', headers, body });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        if (process.env.CURSOR_AGENT_DEBUG) {
-          console.log(`[cursor-agent-h1][debug] BidiAppend seqno=${seqno} status=${res.status} body=${text.slice(0, 256)}`);
+        // Always log — silent failures cause the channel to hang
+        // because the SSE side keeps producing heartbeats while the
+        // conversation can't progress.
+        console.log(`[cursor-agent-h1] BidiAppend FAIL seqno=${seqno} status=${res.status} body=${text.slice(0, 256)}`);
+        // Surface to the bridge so it can either retry (if no content
+        // has been emitted yet — initial runRequest case) or fail-fast
+        // (mid-conversation case). failOrRetry's hasEmittedContent
+        // gate handles both.
+        if (_protoCached) {
+          failOrRetry(_protoCached, `BidiAppend seqno=${seqno} returned ${res.status}: ${text.slice(0, 200)}`, `ERR_BIDI_APPEND_${res.status}`);
+        } else {
+          fail(`BidiAppend seqno=${seqno} returned ${res.status} before stream opened`);
         }
-        // BidiAppend failures don't immediately fail the channel — the
-        // SSE side will see end-of-stream from the server, then the
-        // existing retry/fail path runs. Just log and move on.
-      } else if (process.env.CURSOR_AGENT_DEBUG) {
-        console.log(`[cursor-agent-h1][debug] BidiAppend seqno=${seqno} OK`);
+        return;
       }
+      // Always log success too — when seeing 200s but no stream progress
+      // we need to know the server got the payload but didn't act on it.
+      const okText = await res.text().catch(() => '');
+      console.log(`[cursor-agent-h1] BidiAppend OK seqno=${seqno} body=${okText.slice(0, 64)}`);
     } catch (e) {
-      if (process.env.CURSOR_AGENT_DEBUG) {
-        console.log(`[cursor-agent-h1][debug] BidiAppend seqno=${seqno} error: ${e.message}`);
+      console.log(`[cursor-agent-h1] BidiAppend EXCEPTION seqno=${seqno} error: ${e.message}`);
+      if (_protoCached) {
+        failOrRetry(_protoCached, `BidiAppend seqno=${seqno} fetch error: ${e.message}`, 'ERR_BIDI_APPEND');
+      } else {
+        fail(`BidiAppend seqno=${seqno} fetch error before stream opened: ${e.message}`);
       }
     }
   }
@@ -330,6 +343,14 @@ function startConversation(token, options = {}) {
   // our H1 sendBinaryFrame closure.)
   function sendToolResult(id, execId, content) {
     if (closed) return;
+    const _kind = _nativeExecKinds.get(execId) || 'mcp';
+    const _contentSize = typeof content === 'string' ? content.length
+      : (content == null ? 0 : JSON.stringify(content).length);
+    const _idDesc = id == null ? 'null'
+      : (id instanceof Uint8Array ? `bytes[${id.length}]=${Buffer.from(id).toString('hex').slice(0, 16)}`
+        : typeof id === 'string' ? `str("${id.slice(0, 16)}")`
+        : `${typeof id}=${String(id).slice(0, 32)}`);
+    console.log(`[cursor-agent-h1] sendToolResult id=${_idDesc} execId="${String(execId || '').slice(0, 16)}" kind=${_kind} contentSize=${_contentSize}`);
     turnEndedFired = false;
     lastUsefulFrameAt = Date.now();
     maxIdleMs = 0;
@@ -517,6 +538,14 @@ function startConversation(token, options = {}) {
   // Top-level server message dispatch (mirrors cursor-agent.js)
   function handleServerMessage(msg) {
     const msgCase = msg.message?.case;
+    if (process.env.CURSOR_LOG_SERVER_MSG === '1') {
+      let suffix = '';
+      if (msgCase === 'interactionUpdate') suffix = `:${msg.message.value?.message?.case || '?'}`;
+      else if (msgCase === 'execServerMessage') suffix = `:${msg.message.value?.message?.case || '?'}`;
+      if (!suffix.includes('heartbeat')) {
+        console.log(`[cursor-agent-h1 RX] msgCase=${msgCase}${suffix}`);
+      }
+    }
 
     if (msgCase === 'execServerMessage') {
       markUsefulFrame();

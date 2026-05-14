@@ -463,16 +463,20 @@ function handleClientMessage(client, msg) {
 
     if (action === 'send_tool_result') {
       const entry = toolUseIndex.get(anthropic_tool_use_id);
+      log(`route send_tool_result requestId=${requestId} anthropic_tool_use_id=${anthropic_tool_use_id} found=${!!entry} indexSize=${toolUseIndex.size}`);
       if (!entry) {
+        log(`  ❌ unknown anthropic_tool_use_id — known ids: [${[...toolUseIndex.keys()].slice(0, 5).join(', ')}${toolUseIndex.size > 5 ? '…' : ''}]`);
         writeToClient(client, { type: 'error', requestId, message: `unknown anthropic_tool_use_id: ${anthropic_tool_use_id}` });
         return;
       }
       toolUseIndex.delete(anthropic_tool_use_id);
       const ch = channels.get(entry.channelId);
       if (!ch || ch.state === 'dead') {
+        log(`  ❌ channel ${entry.channelId} no longer alive (state=${ch?.state})`);
         writeToClient(client, { type: 'error', requestId, message: `channel ${entry.channelId} no longer alive` });
         return;
       }
+      log(`  ✅ routing to ${entry.channelId} execId=${entry.execId} (state was ${ch.state})`);
       ch.currentRequestId = requestId;
       ch.state = 'busy';
       ch.lastActivityAt = Date.now();

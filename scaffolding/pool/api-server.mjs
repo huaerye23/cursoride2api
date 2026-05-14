@@ -115,6 +115,27 @@ async function handleMessagesRequest(req, res) {
   if (process.env.LOG_REQUEST_TOOLS === '1') {
     log(`incoming /v1/messages: tools=${Array.isArray(tools) ? tools.length : 0} [${(tools || []).map((t) => t.name).slice(0, 30).join(', ')}]  system=${typeof system === 'string' ? system.length + 'c' : Array.isArray(system) ? 'array(' + system.length + ')' : 'none'}  model=${model || '(default)'}`);
   }
+  // Body summary — every POST gets a one-liner showing the LAST message's
+  // shape. This is the ONE log line you need to see whether a POST is a
+  // tool_result round-trip or a fresh user turn.
+  if (Array.isArray(messages) && messages.length > 0) {
+    const last = messages[messages.length - 1];
+    let summary;
+    if (typeof last.content === 'string') {
+      summary = `text="${last.content.slice(0, 80).replace(/\n/g, '\\n')}"`;
+    } else if (Array.isArray(last.content)) {
+      const parts = last.content.map((c) => {
+        if (c.type === 'tool_result') return `tool_result(id=${c.tool_use_id}, ${typeof c.content === 'string' ? c.content.length + 'c' : 'blocks=' + (Array.isArray(c.content) ? c.content.length : '?')}${c.is_error ? ', is_error=true' : ''})`;
+        if (c.type === 'text') return `text(${(c.text || '').length}c)`;
+        if (c.type === 'image') return 'image';
+        return c.type;
+      });
+      summary = parts.join(', ');
+    } else {
+      summary = `content type=${typeof last.content}`;
+    }
+    log(`  body: lastMsg.role=${last.role} content=[${summary}] msgCount=${messages.length}`);
+  }
   if (!Array.isArray(messages) || messages.length === 0) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'messages required' } }));
@@ -279,11 +300,13 @@ async function handleMessagesRequest(req, res) {
 
   // Send to pool
   if (toolResult) {
+    log(`  → pool send_tool_result requestId=${requestId} tool_use_id=${toolResult.tool_use_id} bytes=${toolResult.text.length}`);
     poolWrite({
       type: 'request', requestId, action: 'send_tool_result',
       anthropic_tool_use_id: toolResult.tool_use_id, content: toolResult.text,
     });
   } else {
+    log(`  → pool send_user_message requestId=${requestId} textBytes=${extractTextFromContent(lastMsg.content).length} tools=${(tools || []).length}`);
     poolWrite({
       type: 'request', requestId, action: 'send_user_message',
       text: extractTextFromContent(lastMsg.content),

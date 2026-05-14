@@ -248,6 +248,7 @@ function attachLiveCallbacks() {
 
 // ── Command handlers ─────────────────────────────────────────────────────
 async function handleMessage(msg) {
+  console.log(`[bridge-worker ch=${CHANNEL_ID}] IPC type=${msg.type} requestId=${msg.requestId || ''} state=${currentState} pendingYield=${!!pendingYield} pendingMcp=${pendingMcpInfo?.execId || 'none'}`);
   if (msg.type === 'open') {
     try {
       await openWithRetry(msg.system || '', msg.tools || []);
@@ -266,7 +267,14 @@ async function handleMessage(msg) {
     currentRequestId = msg.requestId;
     setState('busy');
     lastActivityAt = Date.now();
-    bridge.sendToolResult(pendingYield.id, pendingYield.execId, msg.text || '');
+    console.log(`[bridge-worker ch=${CHANNEL_ID}] BEFORE bridge.sendToolResult(yield_id=${pendingYield.id?.slice?.(0,8)}, yield_execId=${pendingYield.execId?.slice?.(0,8)}, textBytes=${(msg.text||'').length}) bridgeExists=${!!bridge} fnType=${typeof bridge?.sendToolResult}`);
+    try {
+      bridge.sendToolResult(pendingYield.id, pendingYield.execId, msg.text || '');
+      console.log(`[bridge-worker ch=${CHANNEL_ID}] AFTER bridge.sendToolResult (returned cleanly)`);
+    } catch (e) {
+      console.log(`[bridge-worker ch=${CHANNEL_ID}] EXCEPTION in bridge.sendToolResult: ${e.message}\n${e.stack}`);
+      send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId, message: 'sendToolResult threw: ' + e.message });
+    }
     pendingYield = null;
     return;
   }
