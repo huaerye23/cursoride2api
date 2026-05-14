@@ -240,6 +240,7 @@ function handleWorkerMessage(ch, msg) {
     case 'text_delta':
     case 'tool_use':
     case 'yield':
+    case 'step_completed':
     case 'error':
       forwardToClient(ch, msg);
       break;
@@ -414,7 +415,7 @@ function writeToClient(client, obj) {
 
 function handleClientMessage(client, msg) {
   if (msg.type === 'request') {
-    const { requestId, action, text, content, anthropic_tool_use_id, system, tools } = msg;
+    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results } = msg;
 
     if (action === 'send_user_message') {
       // Tool list bootstrap / recycle logic only runs in CONTRACT mode.
@@ -473,6 +474,10 @@ function handleClientMessage(client, msg) {
     }
 
     if (action === 'send_tool_result') {
+      // Legacy single-result action. Kept for backwards-compat. The
+      // parallel-tools fix prefers `send_tool_results` (plural) so a single
+      // POST carrying N parallel tool_results goes to the same channel in
+      // one IPC batch.
       const entry = toolUseIndex.get(anthropic_tool_use_id);
       log(`route send_tool_result requestId=${requestId} anthropic_tool_use_id=${anthropic_tool_use_id} found=${!!entry} indexSize=${toolUseIndex.size}`);
       if (!entry) {
@@ -493,6 +498,59 @@ function handleClientMessage(client, msg) {
       ch.lastActivityAt = Date.now();
       requestClient.set(requestId, client);
       ch.proc.send({ type: 'send_tool_result', requestId, execId: entry.execId, content });
+      return;
+    }
+
+    if (action === 'send_tool_results') {
+      // Parallel-tools fix: a single POST may carry N tool_result blocks
+      // (one per parallel tool_use the model emitted in its previous
+      // assistant turn). Resolve every anthropic_tool_use_id against the
+      // toolUseIndex; ALL must resolve to the SAME channel (they will, by
+      // construction — they were emitted by one channel in one assistant
+      // turn). Defensively error out on mismatch.
+      const rs = Array.isArray(results) ? results : [];
+      if (rs.length === 0) {
+        writeToClient(client, { type: 'error', requestId, message: 'send_tool_results: empty results array' });
+        return;
+      }
+      log(`route send_tool_results requestId=${requestId} count=${rs.length} ids=[${rs.map(r => r.anthropic_tool_use_id).join(', ')}] indexSize=${toolUseIndex.size}`);
+      const resolved = [];
+      let channelId = null;
+      for (const r of rs) {
+        const entry = toolUseIndex.get(r.anthropic_tool_use_id);
+        if (!entry) {
+          log(`  ❌ unknown anthropic_tool_use_id=${r.anthropic_tool_use_id} — known ids: [${[...toolUseIndex.keys()].slice(0, 5).join(', ')}${toolUseIndex.size > 5 ? '…' : ''}]`);
+          writeToClient(client, { type: 'error', requestId, message: `unknown anthropic_tool_use_id: ${r.anthropic_tool_use_id}` });
+          return;
+        }
+        if (channelId === null) channelId = entry.channelId;
+        else if (entry.channelId !== channelId) {
+          log(`  ❌ tool_use_ids span multiple channels: ${channelId} vs ${entry.channelId} (impossible by construction)`);
+          writeToClient(client, {
+            type: 'error', requestId,
+            message: `tool_use_ids span multiple channels (${channelId} vs ${entry.channelId}) — possibly stale conversation`,
+          });
+          return;
+        }
+        resolved.push({ anthropic_tool_use_id: r.anthropic_tool_use_id, execId: entry.execId, content: r.content });
+      }
+      const ch = channels.get(channelId);
+      if (!ch || ch.state === 'dead') {
+        log(`  ❌ channel ${channelId} no longer alive (state=${ch?.state})`);
+        writeToClient(client, { type: 'error', requestId, message: `channel ${channelId} no longer alive` });
+        return;
+      }
+      // Per-id delete from the index (each id resolves only once).
+      for (const r of resolved) toolUseIndex.delete(r.anthropic_tool_use_id);
+      log(`  ✅ routing ${resolved.length} result(s) to ${channelId} execIds=[${resolved.map(r => r.execId).join(', ')}] (state was ${ch.state})`);
+      ch.currentRequestId = requestId;
+      ch.state = 'busy';
+      ch.lastActivityAt = Date.now();
+      requestClient.set(requestId, client);
+      ch.proc.send({
+        type: 'send_tool_results', requestId,
+        results: resolved.map((r) => ({ execId: r.execId, content: r.content })),
+      });
       return;
     }
 

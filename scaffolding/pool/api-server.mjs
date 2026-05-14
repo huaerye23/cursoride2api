@@ -102,16 +102,17 @@ function extractTextFromContent(content) {
   return content.filter((c) => c.type === 'text').map((c) => c.text || '').join('\n');
 }
 
-function findToolResult(content) {
-  if (!Array.isArray(content)) return null;
+function findAllToolResults(content) {
+  if (!Array.isArray(content)) return [];
+  const out = [];
   for (const c of content) {
     if (c.type === 'tool_result') {
       const text = typeof c.content === 'string' ? c.content :
         Array.isArray(c.content) ? c.content.map((p) => p.type === 'text' ? p.text : JSON.stringify(p)).join('\n') : '';
-      return { tool_use_id: c.tool_use_id, text };
+      out.push({ tool_use_id: c.tool_use_id, text });
     }
   }
-  return null;
+  return out;
 }
 
 function extractSystemPrompt(system) {
@@ -252,8 +253,11 @@ async function handleMessagesRequest(req, res) {
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'last message must be user' } }));
   }
 
-  // Decide what to send: tool_result or user message.
-  const toolResult = findToolResult(lastMsg.content);
+  // Decide what to send: tool_result(s) or user message.
+  // Parallel-tool fix: a single POST may carry N tool_result blocks (one
+  // per parallel tool_use the model emitted in its previous assistant
+  // turn). All N must be forwarded to the same pool channel.
+  const toolResults = findAllToolResults(lastMsg.content);
   const requestId = 'req-' + randomUUID().replace(/-/g, '').slice(0, 16);
 
   // Set up SSE
@@ -272,6 +276,29 @@ async function handleMessagesRequest(req, res) {
   let stopReason = 'end_turn';
   let done = false;
   let toolUseEmitted = false;
+  // Parallel-tool-calls fix: after the first tool_use, arm a debounce
+  // backstop. If `step_completed` arrives via the pool first, we finalize
+  // immediately. The 250 ms is a safety net for environments where
+  // stepCompleted isn't bubbled or is late. Mirrors server.js (lines
+  // 677-682) for the legacy direct path.
+  let toolUseFinishTimer = null;
+  const TOOL_USE_DEBOUNCE_MS = parseInt(process.env.POOL_TOOL_USE_DEBOUNCE_MS || '250', 10);
+  function armToolUseFinalizer() {
+    if (toolUseFinishTimer) clearTimeout(toolUseFinishTimer);
+    toolUseFinishTimer = setTimeout(() => {
+      toolUseFinishTimer = null;
+      if (done) return;
+      log(`  → finalize tool_use turn (debounce backstop) requestId=${requestId}`);
+      stopReason = 'tool_use';
+      finishMessage();
+    }, TOOL_USE_DEBOUNCE_MS);
+  }
+  function disarmToolUseFinalizer() {
+    if (toolUseFinishTimer) {
+      clearTimeout(toolUseFinishTimer);
+      toolUseFinishTimer = null;
+    }
+  }
 
   function startMsg() {
     sseWrite(res, 'message_start', {
@@ -363,6 +390,18 @@ async function handleMessagesRequest(req, res) {
       if (msg.type === 'text_delta') {
         emitTextDelta(msg.text);
       } else if (msg.type === 'tool_use') {
+        // Parallel-tool-calls fix: emit the tool_use block but DO NOT finish
+        // the message here. The model may emit several tool_uses in a single
+        // assistant turn — each must get its own content_block_start with a
+        // distinct index. We only finish the response when:
+        //   (a) the pool reports `step_completed` (the model has finished
+        //       emitting this step's tool_uses and is now waiting on results) —
+        //       immediate finalize, OR
+        //   (b) the 250 ms debounce backstop fires (if step_completed is
+        //       delayed or missing), OR
+        //   (c) the pool reports `yield` (end_turn case — the model never
+        //       called any tool, only text).
+        //
         // In contract mode, names are passed through unchanged.
         // In translate mode, the model emitted a Cursor name (e.g. Shell);
         // we map to the Anthropic name (Bash) and adapt args. If the
@@ -375,12 +414,17 @@ async function handleMessagesRequest(req, res) {
             // Rejection — feed the error back through the pool to the inner
             // agent. The api-server's request stream stays open; the inner
             // agent will keep generating after seeing this tool_result.
+            // Use the batch shape with a single entry so the pool path
+            // remains consistent (manager + worker only know the new
+            // `send_tool_results` action after the parallel-tools fix).
             poolWrite({
               type: 'request',
               requestId: requestId + ':auto_reject',
-              action: 'send_tool_result',
-              anthropic_tool_use_id: msg.anthropic_id,
-              content: `[proxy_error] ${xlated.error}`,
+              action: 'send_tool_results',
+              results: [{
+                anthropic_tool_use_id: msg.anthropic_id,
+                content: `[proxy_error] ${xlated.error}`,
+              }],
             });
             // Don't emit anything to the client — pretend the tool_use
             // never happened from claude-code's POV.
@@ -392,12 +436,34 @@ async function handleMessagesRequest(req, res) {
           log(`→ tool_use to client: name=${msg.name} args=${JSON.stringify(msg.args).slice(0, 200)}`);
           emitToolUseBlock(msg.anthropic_id, msg.name, msg.args);
         }
+        // Mark that we should end with stop_reason='tool_use' when the
+        // turn finalizes. Arm the debounce backstop after every tool_use
+        // (each new one resets the timer — more may still arrive).
         stopReason = 'tool_use';
-        finishMessage();
+        armToolUseFinalizer();
+      } else if (msg.type === 'step_completed') {
+        // The pool's bridge-worker observed `interactionUpdate.stepCompleted`
+        // from cursor-agent. If any tool_uses have been emitted on this
+        // turn, the model is now paused waiting for the tool_result(s).
+        // Finalize the SSE immediately — saves the 250 ms debounce on the
+        // common single-tool case, and is the deterministic signal in the
+        // parallel-tools case.
+        if (toolUseEmitted && !done) {
+          log(`  → finalize tool_use turn (step_completed) requestId=${requestId}`);
+          disarmToolUseFinalizer();
+          stopReason = 'tool_use';
+          finishMessage();
+        }
       } else if (msg.type === 'yield') {
+        // The model called bajie_yield. If any tool_uses were emitted this
+        // turn (rare — usually finalize happens earlier via step_completed
+        // or the debounce), stop_reason='tool_use'. Otherwise the model
+        // sent pure-text and then yielded — that's stop_reason='end_turn'.
+        disarmToolUseFinalizer();
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
         finishMessage();
       } else if (msg.type === 'error') {
+        disarmToolUseFinalizer();
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
         finishMessage();
       }
@@ -405,11 +471,19 @@ async function handleMessagesRequest(req, res) {
   });
 
   // Send to pool
-  if (toolResult) {
-    log(`  → pool send_tool_result requestId=${requestId} tool_use_id=${toolResult.tool_use_id} bytes=${toolResult.text.length}`);
+  if (toolResults.length > 0) {
+    // Batch send: pool-manager + bridge-worker both understand
+    // `send_tool_results` (plural) with an array of entries. All N entries
+    // must resolve to the same channel — the manager defensively checks
+    // this and errors out if not (which shouldn't happen by construction,
+    // since they were all emitted by one channel in one assistant turn).
+    log(`  → pool send_tool_results requestId=${requestId} count=${toolResults.length} ids=[${toolResults.map(r => r.tool_use_id).join(', ')}]`);
     poolWrite({
-      type: 'request', requestId, action: 'send_tool_result',
-      anthropic_tool_use_id: toolResult.tool_use_id, content: toolResult.text,
+      type: 'request', requestId, action: 'send_tool_results',
+      results: toolResults.map((r) => ({
+        anthropic_tool_use_id: r.tool_use_id,
+        content: r.text,
+      })),
     });
   } else {
     // Mode selection: in `full` mode, render the ENTIRE messages[] into
@@ -432,6 +506,7 @@ async function handleMessagesRequest(req, res) {
   req.on('close', () => {
     if (!done) {
       log(`client disconnected mid-stream for ${requestId}`);
+      disarmToolUseFinalizer();
       finishMessage();
     }
   });

@@ -58,7 +58,13 @@ let openedAt = 0;
 let lastActivityAt = Date.now();
 let currentRequestId = null;
 let pendingYield = null;
-let pendingMcpInfo = null;     // a non-yield mcp call we're currently holding
+// Map<execId, info> — tracks every non-yield mcp call we're currently holding.
+// In the parallel-tools case the model emits N tool_uses in one assistant
+// turn (e.g. Bash + Read back-to-back); each gets its own execId. We must
+// retain all of them until tool_results arrive, otherwise the 2nd
+// onMcpCall would clobber the 1st (the original bug). The map is cleared
+// per-execId in the send_tool_result handler after each dispatch.
+const pendingMcpInfo = new Map();
 let configuredTools = [];
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -222,14 +228,27 @@ function attachLiveCallbacks() {
     onMcpCall: (info) => {
       lastActivityAt = Date.now();
       if (info.toolName === YIELD_TOOL_NAME) {
+        // The model called bajie_yield — the turn is over. Any pending
+        // non-yield tool_uses being held should be cleared (they were
+        // resolved earlier in this turn or never resolved cleanly; either
+        // way they're done).
         pendingYield = info;
-        pendingMcpInfo = null;
+        pendingMcpInfo.clear();
         const finishedReqId = currentRequestId;
         currentRequestId = null;
         setState('ready');
         send({ type: 'yield', channelId: CHANNEL_ID, requestId: finishedReqId });
       } else {
-        pendingMcpInfo = info;
+        // Parallel-tools fix: store every non-yield mcp call in the map
+        // keyed by execId — DO NOT overwrite. In the parallel case the
+        // model emits multiple onMcpCall events back-to-back (e.g.
+        // Bash + Read); each must be retrievable when its tool_result
+        // arrives via send_tool_result. Previously this was a single
+        // variable that the 2nd call clobbered, which was the bug heart.
+        pendingMcpInfo.set(info.execId, info);
+        // The model has emitted a tool_use; it's no longer waiting in a
+        // yield, so clear pendingYield. (A yield-result followup would
+        // arrive via send_user_message, not via this path.)
         pendingYield = null;
         send({
           type: 'tool_use',
@@ -239,10 +258,18 @@ function attachLiveCallbacks() {
           name: info.toolName,
           args: info.args,
         });
-        // We stay busy until tool_result is fed.
+        // We stay busy until tool_result(s) feed in.
       }
     },
-    onStepCompleted: () => {},
+    onStepCompleted: () => {
+      // Forward step boundaries so api-server can finalize a tool_use turn
+      // promptly (no 250 ms debounce wait) once the model has emitted all
+      // its parallel tool_uses for this step and is now paused waiting
+      // for results.
+      if (currentRequestId != null) {
+        send({ type: 'step_completed', channelId: CHANNEL_ID, requestId: currentRequestId });
+      }
+    },
     onTurnEnded: () => {
       // Shouldn't normally fire unless the model failed to yield.
       if (currentRequestId != null) {
@@ -264,7 +291,7 @@ function attachLiveCallbacks() {
 
 // ── Command handlers ─────────────────────────────────────────────────────
 async function handleMessage(msg) {
-  console.log(`[bridge-worker ch=${CHANNEL_ID}] IPC type=${msg.type} requestId=${msg.requestId || ''} state=${currentState} pendingYield=${!!pendingYield} pendingMcp=${pendingMcpInfo?.execId || 'none'}`);
+  console.log(`[bridge-worker ch=${CHANNEL_ID}] IPC type=${msg.type} requestId=${msg.requestId || ''} state=${currentState} pendingYield=${!!pendingYield} pendingMcp=[${[...pendingMcpInfo.keys()].map(k => k.slice(0, 8)).join(',') || 'none'}]`);
   if (msg.type === 'open') {
     try {
       await openWithRetry(msg.system || '', msg.tools || []);
@@ -296,16 +323,68 @@ async function handleMessage(msg) {
   }
 
   if (msg.type === 'send_tool_result') {
-    if (!pendingMcpInfo || (msg.execId && msg.execId !== pendingMcpInfo.execId)) {
-      send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
-        message: `no matching pending tool_use (have=${pendingMcpInfo?.execId} want=${msg.execId})` });
+    // Singular form (legacy / kept for compat). Looks up the pending info
+    // by execId in the map. The map may hold multiple entries when the
+    // model fired parallel tool_uses; we only consume the matching one
+    // and leave the others pending for their own send_tool_result.
+    const info = pendingMcpInfo.get(msg.execId);
+    if (!info) {
+      send({
+        type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
+        message: `no matching pending tool_use (have=[${[...pendingMcpInfo.keys()].join(',') || 'none'}] want=${msg.execId})`,
+      });
       return;
     }
     currentRequestId = msg.requestId;
     setState('busy');
     lastActivityAt = Date.now();
-    bridge.sendToolResult(pendingMcpInfo.id, pendingMcpInfo.execId, msg.content || '');
-    pendingMcpInfo = null;
+    bridge.sendToolResult(info.id, info.execId, msg.content || '');
+    pendingMcpInfo.delete(msg.execId);
+    return;
+  }
+
+  if (msg.type === 'send_tool_results') {
+    // Plural form (parallel-tools fix): dispatch N tool_results in one IPC
+    // batch. Each result targets a distinct execId in the pendingMcpInfo
+    // map. The underlying transport (cursor-agent-h1 / cursor-agent.js)
+    // supports per-execId result dispatch via _nativeExecKinds, so we just
+    // call bridge.sendToolResult(id, execId, content) N times.
+    const results = Array.isArray(msg.results) ? msg.results : [];
+    if (results.length === 0) {
+      send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
+        message: 'send_tool_results: empty results array' });
+      return;
+    }
+    // Validate every execId resolves before we dispatch anything — partial
+    // dispatch on bad input would leave the model waiting on results that
+    // never come.
+    const dispatchPlan = [];
+    for (const r of results) {
+      const info = pendingMcpInfo.get(r.execId);
+      if (!info) {
+        send({
+          type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
+          message: `no matching pending tool_use for execId=${r.execId} (have=[${[...pendingMcpInfo.keys()].join(',') || 'none'}])`,
+        });
+        return;
+      }
+      dispatchPlan.push({ info, content: r.content || '' });
+    }
+    currentRequestId = msg.requestId;
+    setState('busy');
+    lastActivityAt = Date.now();
+    for (const { info, content } of dispatchPlan) {
+      try {
+        bridge.sendToolResult(info.id, info.execId, content);
+        pendingMcpInfo.delete(info.execId);
+      } catch (e) {
+        send({
+          type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
+          message: `bridge.sendToolResult threw for execId=${info.execId}: ${e.message}`,
+        });
+        return;
+      }
+    }
     return;
   }
 
