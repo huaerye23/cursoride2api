@@ -22,6 +22,16 @@ const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);  // 20
 const PING_TIMEOUT_MS = parseInt(process.env.PING_TIMEOUT_MS || '45000', 10);
 const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10); // wait between worker spawns
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
+// Protocol the bridge workers use to talk to Cursor's backend.
+//   h2 (default) — HTTP/2 BiDi via /agent.v1.AgentService/Run
+//   h1           — HTTP/1.1 via BidiAppend + RunSSE pair (rate-limit hypothesis)
+// Propagated to each forked worker as BRIDGE_PROTOCOL. See
+// scaffolding/pool/RUNSSE.md for the protocol notes.
+const POOL_BRIDGE_PROTOCOL = (process.env.POOL_BRIDGE_PROTOCOL || 'h2').toLowerCase();
+if (!['h1', 'h2'].includes(POOL_BRIDGE_PROTOCOL)) {
+  console.error(`invalid POOL_BRIDGE_PROTOCOL=${POOL_BRIDGE_PROTOCOL} (must be h1|h2)`);
+  process.exit(1);
+}
 // How many channels are allowed to run the retry lottery concurrently.
 // Default 1 (sequential, safe against rate-limit). Set higher to bring the
 // pool up faster at risk of tripping ERROR_PRO_USER_RATE_LIMIT_EXCEEDED.
@@ -121,6 +131,8 @@ function spawnChannel() {
     ...process.env,
     RATLC_CHANNEL_ID: channelId,
     RATLC_MODEL: POOL_MODEL,
+    // Propagate the bridge transport choice to each worker.
+    BRIDGE_PROTOCOL: POOL_BRIDGE_PROTOCOL,
     // In translate mode, the worker tells startConversation to passthrough
     // native Cursor tools (Shell/Read/Write/Grep/Fetch) as MCP-shape
     // tool_use events with Anthropic names (Bash/Read/Write/Grep/WebFetch).
@@ -566,6 +578,7 @@ function statusSnapshot() {
     config: {
       model: POOL_MODEL,
       toolMode: POOL_TOOL_MODE,
+      bridgeProtocol: POOL_BRIDGE_PROTOCOL,
       concurrentOpens: POOL_CONCURRENT_OPENS,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
@@ -603,7 +616,7 @@ const server = net.createServer((socket) => {
   });
 });
 server.listen(POOL_SOCK, () => {
-  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}`);
+  log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}, protocol=${POOL_BRIDGE_PROTOCOL}`);
 });
 
 // ── Spawn initial pool, honoring POOL_CONCURRENT_OPENS ───────────────────

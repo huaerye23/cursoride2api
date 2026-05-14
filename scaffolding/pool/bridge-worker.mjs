@@ -7,10 +7,30 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 
 const require = createRequire(import.meta.url);
-const { startConversation } = require('../../src/cursor-agent.js');
+
+// ── Protocol switch ─────────────────────────────────────────────────────
+// BRIDGE_PROTOCOL selects which transport this worker uses:
+//   h2 (default) — src/cursor-agent.js, HTTP/2 BiDi stream on
+//                  /agent.v1.AgentService/Run. Existing production path.
+//   h1           — src/cursor-agent-h1.js, BidiAppend (HTTP/1.1 unary)
+//                  + RunSSE (HTTP/1.1 server-streaming) pair.
+//                  Hypothesis: bypasses the H2 path's per-account
+//                  ERROR_PRO_USER_RATE_LIMIT_EXCEEDED so a 10+-channel
+//                  pool can run in parallel. See scaffolding/pool/RUNSSE.md.
+const BRIDGE_PROTOCOL = (process.env.BRIDGE_PROTOCOL || 'h2').toLowerCase();
+let startConversation;
+if (BRIDGE_PROTOCOL === 'h1') {
+  ({ startConversation } = require('../../src/cursor-agent-h1.js'));
+} else if (BRIDGE_PROTOCOL === 'h2') {
+  ({ startConversation } = require('../../src/cursor-agent.js'));
+} else {
+  console.error(`[bridge-worker] invalid BRIDGE_PROTOCOL=${BRIDGE_PROTOCOL} (expected h1 or h2)`);
+  process.exit(1);
+}
 
 const CHANNEL_ID = process.env.RATLC_CHANNEL_ID || 'ch-?';
 const MODEL = process.env.RATLC_MODEL || 'claude-opus-4-7-thinking-max-fast';
+console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL}`);
 const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '500', 10);
 const OPEN_RETRY_MS = parseInt(process.env.RATLC_OPEN_RETRY_MS || '300', 10);
 // When true, native Cursor tool calls (shellArgs/readArgs/writeArgs/...)
