@@ -184,12 +184,18 @@ async function openWithRetry(system, callerTools) {
   const primingPrompt = buildPrimingPrompt(system, cTools);
 
   setState('opening');
-  // Empirically (confirmed on Mac), every Cursor refusal during open —
-  // unpaid_invoice, soft "Please wait" rate-limit, hard RATE_LIMIT_EXCEEDED,
-  // no_yield — is short-lived. Backing off makes things worse, not better:
-  // the channel sits idle while the gate has long since cleared. So we just
-  // retry every OPEN_RETRY_MS (default 300 ms) regardless of error kind,
-  // with a ±25% jitter so 5 concurrent channels don't burst-synchronize.
+  // Both soft "Please wait" and hard RATE_LIMIT_EXCEEDED are real
+  // back-pressure signals from Cursor: when we ignore them and keep firing,
+  // the soft-throttle tightens (88%+ of attempts return "Please wait" after
+  // ~30 min of 300 ms retry pressure). Exponential 5s → 60s gives Cursor
+  // room to relax. The reset on unpaid_invoice / no_yield is the critical
+  // fix vs the pre-tuning code: a transient rate-limit burst can't
+  // permanently park a channel at the 60 s cap, because the probabilistic
+  // gate firing (which means our requests ARE getting through) resets the
+  // backoff to its floor.
+  const RATE_LIMIT_FLOOR_MS = 5000;
+  const RATE_LIMIT_CEILING_MS = 60000;
+  let rateLimitBackoff = RATE_LIMIT_FLOOR_MS;
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
     // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
@@ -207,13 +213,29 @@ async function openWithRetry(system, callerTools) {
       setState('ready');
       return;
     }
-    if (result.kind === 'other_error') {
-      setState('dead', { error: result.msg || result.kind });
-      process.exit(1);
+    if (result.kind === 'unpaid' || result.kind === 'no_yield') {
+      // Probabilistic gate or empty response — our request reached the
+      // backend cleanly, so the system isn't throttling us right now.
+      // Reset the rate-limit backoff to its floor.
+      rateLimitBackoff = RATE_LIMIT_FLOOR_MS;
+      await sleep(jitter(OPEN_RETRY_MS));
+      continue;
     }
-    // unpaid / rate_limit_soft / rate_limit_hard / no_yield → just retry.
-    await sleep(jitter(OPEN_RETRY_MS));
-    continue;
+    if (result.kind === 'rate_limit_soft' || result.kind === 'rate_limit_hard') {
+      // Both kinds are back-pressure signals: share one exponential
+      // backoff so sustained throttling, regardless of variant,
+      // ramps us down. Resets above on the first unpaid/no_yield.
+      const sleepMs = jitter(rateLimitBackoff);
+      if (result.kind === 'rate_limit_hard') {
+        send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt}, backoff ${sleepMs}ms` });
+      }
+      await sleep(sleepMs);
+      rateLimitBackoff = Math.min(Math.floor(rateLimitBackoff * 1.5), RATE_LIMIT_CEILING_MS);
+      continue;
+    }
+    // other_error — die.
+    setState('dead', { error: result.msg || result.kind });
+    process.exit(1);
   }
   setState('dead', { error: 'open exhausted' });
   process.exit(1);
