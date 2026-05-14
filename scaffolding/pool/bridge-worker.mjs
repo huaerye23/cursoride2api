@@ -194,7 +194,13 @@ async function openWithRetry(system, callerTools) {
   // gate firing (which means our requests ARE getting through) resets the
   // backoff to its floor.
   const RATE_LIMIT_FLOOR_MS = 5000;
-  const RATE_LIMIT_CEILING_MS = 60000;
+  // 15s cap (was 60s). With sustained rate-limit hits (no unpaid_invoice
+  // between to trigger the reset), the backoff escalates 5→7.5→11→17→25
+  // and tops out at 15s instead of 60s. Channel still makes 1 attempt
+  // every ~15s in the worst case rather than 1/min — keeps the gate
+  // sampling rate high enough that a lucky window is found within
+  // reasonable time. Tune via RATLC_BACKOFF_CEILING_MS.
+  const RATE_LIMIT_CEILING_MS = parseInt(process.env.RATLC_BACKOFF_CEILING_MS || '15000', 10);
   let rateLimitBackoff = RATE_LIMIT_FLOOR_MS;
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
