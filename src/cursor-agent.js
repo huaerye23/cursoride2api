@@ -642,7 +642,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
     const result = create(A.RequestContextResultSchema, {
       result: { case: 'success', value: create(A.RequestContextSuccessSchema, { requestContext }) },
     });
-    sendExecClientMessage(id, execId, 'requestContextResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'requestContextResult', result, sendBinaryFrame);
     return 'requestContext';
   }
 
@@ -659,32 +659,37 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
   const REJECT_REASON = 'Tool not available; use MCP tools.';
 
   // ── Reject native Cursor tools so the model falls back to MCP ──
+  // Every reject path emits a single ExecClientMessage and then must close
+  // the exec stream with ExecClientControlMessage(streamClose{id}). The IDE's
+  // own executor loop (workbench.desktop.main.js, $jb.handle) does this
+  // unconditionally after each handler's yielded items — see
+  // scaffolding/pool/TOOL_USE_HANG_FINDINGS.md for the root-cause analysis.
   if (msgCase === 'readArgs') {
     const result = create(A.ReadResultSchema, {
       result: { case: 'rejected', value: create(A.ReadRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'readResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'readResult', result, sendBinaryFrame);
     return 'read';
   }
   if (msgCase === 'lsArgs') {
     const result = create(A.LsResultSchema, {
       result: { case: 'rejected', value: create(A.LsRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'lsResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'lsResult', result, sendBinaryFrame);
     return 'ls';
   }
   if (msgCase === 'writeArgs') {
     const result = create(A.WriteResultSchema, {
       result: { case: 'rejected', value: create(A.WriteRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'writeResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'writeResult', result, sendBinaryFrame);
     return 'write';
   }
   if (msgCase === 'deleteArgs') {
     const result = create(A.DeleteResultSchema, {
       result: { case: 'rejected', value: create(A.DeleteRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'deleteResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'deleteResult', result, sendBinaryFrame);
     return 'delete';
   }
   if (msgCase === 'shellArgs') {
@@ -699,7 +704,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
         }),
       },
     });
-    sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'shellResult', result, sendBinaryFrame);
     return 'shell';
   }
   if (msgCase === 'shellStreamArgs') {
@@ -715,7 +720,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
         }),
       },
     });
-    sendExecClientMessage(id, execId, 'shellStream', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'shellStream', result, sendBinaryFrame);
     return 'shellStream';
   }
   if (msgCase === 'backgroundShellSpawnArgs') {
@@ -730,35 +735,35 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
         }),
       },
     });
-    sendExecClientMessage(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
     return 'backgroundShell';
   }
   if (msgCase === 'grepArgs') {
     const result = create(A.GrepResultSchema, {
       result: { case: 'error', value: create(A.GrepErrorSchema, { error: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'grepResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'grepResult', result, sendBinaryFrame);
     return 'grep';
   }
   if (msgCase === 'fetchArgs') {
     const result = create(A.FetchResultSchema, {
       result: { case: 'error', value: create(A.FetchErrorSchema, { url: msgValue?.url || '', error: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'fetchResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
     return 'fetch';
   }
   if (msgCase === 'writeShellStdinArgs') {
     const result = create(A.WriteShellStdinResultSchema, {
       result: { case: 'error', value: create(A.WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'writeShellStdinResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'writeShellStdinResult', result, sendBinaryFrame);
     return 'writeShellStdin';
   }
   if (msgCase === 'diagnosticsArgs') {
     const result = create(A.DiagnosticsResultSchema, {
       result: { case: 'success', value: create(A.DiagnosticsSuccessSchema, { path: msgValue?.path || '', diagnostics: [], totalDiagnostics: 0 }) },
     });
-    sendExecClientMessage(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
     return 'diagnostics';
   }
 
@@ -769,7 +774,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
     const result = create(A.ListMcpResourcesExecResultSchema, {
       success: create(A.ListMcpResourcesSuccessSchema, { resources: [] }),
     });
-    sendExecClientMessage(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
     return 'listMcpResources';
   }
 
@@ -874,6 +879,42 @@ function sendExecClientMessage(id, execId, messageCase, value, sendBinaryFrame) 
     message: { case: 'execClientMessage', value: execClient },
   });
   sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+}
+
+// ── Build an ExecClientControlMessage and send it as a binary connect frame ──
+// Used to terminate an exec stream after the final result/event has been sent.
+// The Cursor IDE (see workbench.desktop.main.js, ControlledExecManager $jb,
+// "c1c.handle") writes `ExecClientControlMessage(streamClose{id})` after the
+// last `ExecClientMessage` of EVERY exec — whether unary (shellResult,
+// mcpResult, readResult, ...) or streaming (shellStream{stdout, exit}).
+// Without it, Cursor's backend keeps the streaming exec slot open and the
+// model stalls mid-second-tool-call waiting for the stream to end. This was
+// the proximate cause of the tool_use round-trip hang documented in
+// scaffolding/pool/TOOL_USE_HANG_FINDINGS.md.
+function sendExecClientControlMessage(id, controlCase, sendBinaryFrame) {
+  const { create, toBinary, agent } = _requireProto();
+  let value;
+  if (controlCase === 'streamClose') {
+    value = create(agent.ExecClientStreamCloseSchema, { id });
+  } else if (controlCase === 'heartbeat') {
+    value = create(agent.ExecClientHeartbeatSchema, { id });
+  } else {
+    throw new Error(`Unsupported control message case: ${controlCase}`);
+  }
+  const ctrl = create(agent.ExecClientControlMessageSchema, {
+    message: { case: controlCase, value },
+  });
+  const wrapper = create(agent.AgentClientMessageSchema, {
+    message: { case: 'execClientControlMessage', value: ctrl },
+  });
+  sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+}
+
+// Convenience: send an ExecClientMessage then immediately a streamClose
+// control message with the same id. Mirrors the IDE's $jb.handle pattern.
+function sendExecClientMessageAndClose(id, execId, messageCase, value, sendBinaryFrame) {
+  sendExecClientMessage(id, execId, messageCase, value, sendBinaryFrame);
+  sendExecClientControlMessage(id, 'streamClose', sendBinaryFrame);
 }
 
 // ── KV server message handling (blob store handshake) ──
@@ -1223,11 +1264,15 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'shellResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'shellStream') {
-        // shellStream is a multi-event stream. Send stdout chunk + exit.
+        // shellStream is a multi-event stream. Send stdout chunk + exit, then
+        // ExecClientControlMessage(streamClose{id}) — the IDE's executor
+        // loop (workbench.desktop.main.js, $jb/c1c.handle) writes streamClose
+        // unconditionally after the last yielded ExecClientMessage. Without
+        // it Cursor's backend keeps the stream "open" and the model stalls.
         const stdoutEvt = create(agent.ShellStreamSchema, {
           event: {
             case: 'stdout',
@@ -1242,6 +1287,7 @@ function startConversation(token, options = {}) {
           },
         });
         sendExecClientMessage(id, execId, 'shellStream', exitEvt, sendBinaryFrame);
+        sendExecClientControlMessage(id, 'streamClose', sendBinaryFrame);
         return;
       }
       if (nativeKind === 'backgroundShell') {
@@ -1256,7 +1302,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'read') {
@@ -1270,7 +1316,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'readResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'readResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'write') {
@@ -1283,7 +1329,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'writeResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'writeResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'fetch') {
@@ -1296,7 +1342,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'fetchResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'grep') {
@@ -1306,7 +1352,7 @@ function startConversation(token, options = {}) {
         const result = create(agent.GrepResultSchema, {
           result: { case: 'error', value: create(agent.GrepErrorSchema, { error: text || '(no matches)' }) },
         });
-        sendExecClientMessage(id, execId, 'grepResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'grepResult', result, sendBinaryFrame);
         return;
       }
       // Unknown native kind — fall through to mcpResult (shouldn't happen)
@@ -1348,7 +1394,7 @@ function startConversation(token, options = {}) {
       });
     }
     console.log(`[cursor-agent] sending tool result execId=${execId} ${summary}`);
-    sendExecClientMessage(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
   }
 
   // Top-level server message dispatch
@@ -2031,6 +2077,8 @@ module.exports = {
   handleKvMessage,
   handleInteractionQuery,
   sendExecClientMessage,
+  sendExecClientControlMessage,
+  sendExecClientMessageAndClose,
   sendKvResponse,
   frameConnectMessage,
 };

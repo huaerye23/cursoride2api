@@ -47,6 +47,8 @@ const {
   handleKvMessage,
   handleInteractionQuery,
   sendExecClientMessage,
+  sendExecClientControlMessage,
+  sendExecClientMessageAndClose,
   sendKvResponse,
   frameConnectMessage,
 } = require('./cursor-agent');
@@ -420,10 +422,15 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'shellResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'shellStream') {
+        // Multi-event stream. After stdout + exit, the IDE's executor loop
+        // (workbench.desktop.main.js, $jb/c1c.handle) writes
+        // ExecClientControlMessage(streamClose{id}) — without it Cursor's
+        // backend keeps the exec stream "open" and the model stalls
+        // mid-second-tool-call (see scaffolding/pool/TOOL_USE_HANG_FINDINGS.md).
         const stdoutEvt = create(agent.ShellStreamSchema, {
           event: { case: 'stdout', value: create(agent.ShellStreamStdoutSchema, { data: text }) },
         });
@@ -432,6 +439,7 @@ function startConversation(token, options = {}) {
           event: { case: 'exit', value: create(agent.ShellStreamExitSchema, { code: 0, cwd: '', aborted: false }) },
         });
         sendExecClientMessage(id, execId, 'shellStream', exitEvt, sendBinaryFrame);
+        sendExecClientControlMessage(id, 'streamClose', sendBinaryFrame);
         return;
       }
       if (nativeKind === 'backgroundShell') {
@@ -444,7 +452,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'read') {
@@ -458,7 +466,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'readResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'readResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'write') {
@@ -471,7 +479,7 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'writeResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'writeResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'fetch') {
@@ -484,14 +492,14 @@ function startConversation(token, options = {}) {
             }),
           },
         });
-        sendExecClientMessage(id, execId, 'fetchResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'grep') {
         const result = create(agent.GrepResultSchema, {
           result: { case: 'error', value: create(agent.GrepErrorSchema, { error: text || '(no matches)' }) },
         });
-        sendExecClientMessage(id, execId, 'grepResult', result, sendBinaryFrame);
+        sendExecClientMessageAndClose(id, execId, 'grepResult', result, sendBinaryFrame);
         return;
       }
     }
@@ -532,7 +540,7 @@ function startConversation(token, options = {}) {
       });
     }
     console.log(`[cursor-agent-h1] sending tool result execId=${execId} ${summary}`);
-    sendExecClientMessage(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
   }
 
   // Top-level server message dispatch (mirrors cursor-agent.js)

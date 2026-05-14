@@ -1,5 +1,12 @@
 # Tool-use round-trip hang — root cause findings
 
+**STATUS: RESOLVED 2026-05-14.** Root cause = missing
+`ExecClientControlMessage(streamClose{id})` after each tool result.
+Fix: send streamClose after every `ExecClientMessage` in
+`sendToolResult` and `handleExecMessage` reject paths. Verified end-to-end
+with `tool-roundtrip-test.mjs` (step 2 PASS, `stopReason=end_turn`).
+See "Resolution" section at bottom.
+
 Captured 2026-05-14 after end-to-end instrumentation of api-server,
 pool-manager, bridge-worker, and cursor-agent-h1. Test reproducer:
 `scaffolding/pool/tool-roundtrip-test.mjs`.
@@ -118,3 +125,69 @@ node scaffolding/pool/tool-roundtrip-test.mjs
 | `cursor-agent-h1.js` | `sendToolResult id=... execId=... kind=... contentSize=...` |
 | `cursor-agent-h1.js` | always-on `BidiAppend OK seqno=N body={...}` + always-on `BidiAppend FAIL/EXCEPTION` |
 | `cursor-agent-h1.js` | opt-in `[cursor-agent-h1 RX] msgCase=...` (via `CURSOR_LOG_SERVER_MSG=1`) |
+
+## Resolution
+
+The proximate cause was found by reading the Cursor IDE bundle's
+`ControlledExecManager` ($jb / c1c in `workbench.desktop.main.js`,
+~offset 22546044). Pseudocode:
+
+```js
+// In c1c.handle, after dispatching the exec_server_message to a registered
+// handler and iterating its async-generator output:
+try {
+  for await (const k of d) await m.write(k);         // each ExecClientMessage
+  await m.write(new _4e({                            // <-- the missing message
+    message: { case: "streamClose", value: new q_c({ id: t.id }) }
+  }));
+} catch (e) { ... }
+```
+
+The IDE writes `ExecClientControlMessage(streamClose{id: <execMsg.id>})`
+**after every exec handler completes**, whether unary (shellResult,
+mcpResult, readResult, ...) or streaming (shellStream{stdout, exit}).
+Cursor's backend uses streamClose as the "tool call complete" signal —
+without it, the exec slot stays open server-side and the next-turn
+model state never unblocks.
+
+Our proxy was emitting only the `ExecClientMessage` items and never the
+`streamClose`. The model would begin its next turn (we saw `textDelta`,
+`partialToolCall`, `toolCallDelta` arrive on RunSSE) then deadlock
+mid-second-tool-call waiting for the previous exec stream to terminate.
+
+### Fix
+
+Two changes in `src/cursor-agent.js`:
+
+1. New helpers `sendExecClientControlMessage(id, controlCase, sendBinaryFrame)`
+   and `sendExecClientMessageAndClose(id, execId, messageCase, value, sendBinaryFrame)`.
+   Both build the connect frame for `agent.ExecClientControlMessageSchema`
+   wrapping `agent.ExecClientStreamCloseSchema{id}`. `id` is the uint32
+   from the originating `ExecServerMessage.id` (NOT the string `execId`).
+2. Every native exec result emission (shellResult, shellStream, readResult,
+   writeResult, fetchResult, grepResult, backgroundShellSpawnResult,
+   mcpResult, requestContextResult, lsResult, deleteResult,
+   diagnosticsResult, writeShellStdinResult, listMcpResourcesExecResult)
+   and every reject-path emission now emits a matching streamClose.
+
+`src/cursor-agent-h1.js` mirrors the same pattern in its local
+`sendToolResult` closure (the H1 path).
+
+### Schema reference
+
+- `agent.v1.ExecClientControlMessage { oneof message { ExecClientStreamClose stream_close; ExecClientThrow throw; ExecClientHeartbeat heartbeat; } }`
+- `agent.v1.ExecClientStreamClose { uint32 id = 1; }`
+
+Both already in `src/proto/agent_pb.mjs` (no proto change needed).
+
+### Verification
+
+```
+$ node scaffolding/pool/tool-roundtrip-test.mjs
+━━━ STEP 1: POST user message with Bash tool ━━━
+[step1] ✅ PASS — tool_use_id=toolu_d55eee974d3a4250, name=Bash, input={"command":"pwd"}
+━━━ STEP 2: POST tool_result for toolu_d55eee974d3a4250 ━━━
+Your current directory is `/Users/juncwang`.
+[step2] ✅ PASS — 44 chars of text, stopReason=end_turn
+Total time: 34081ms
+```
