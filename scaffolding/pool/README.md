@@ -56,6 +56,10 @@ the children + api-server).
 | `POOL_CONCURRENT_OPENS` | `1`–`5` | `1` | How many channels open in parallel. `1` is safe but slow; `5` is faster but more rate-limit pressure. **At `>=5`, H2 trips the per-account rate limit**; H1 is fine. |
 | `POOL_SIZE` | integer | `1` (cli `up N` overrides) | Target channel count. `./scaffolding/pool/ratlc up N` is the easy way. |
 | `POOL_MODEL` | model id | `claude-opus-4-7-thinking-max-fast` | Which Cursor model to drive. |
+| `POOL_REINJECT_THINKING` | `0` \| `1` | `0` | Captures the model's `thinking_delta` per `convKey`; on the next turn for the same conversation, prepends `<thinking>…</thinking>` text into the outbound prompt. Pool-side symmetry with `server.js`'s `CURSOR_REINJECT_THINKING`. See [§ Thinking continuity](#thinking-continuity) below. |
+| `POOL_REINJECT_THINKING_MAX_BYTES_PER_TURN` | int | `4096` | Cap on captured bytes per assistant turn (truncates further deltas in the same turn). Matches server.js's default. |
+| `POOL_REINJECT_THINKING_MAX_TURNS` | int | `5` | Number of past assistant turns kept per `convKey`; FIFO-evicts older. |
+| `POOL_REINJECT_THINKING_DEBUG` | `1` | unset | Exposes `/v1/_debug/thinking_buffer` and `/v1/_debug/render` for buffer inspection. Off in normal operation. |
 | `CURSOR_AGENT_DEBUG` | `1` | unset | Per-line wire debug from cursor-agent (verbose) |
 | `CURSOR_LOG_SERVER_MSG` | `1` | unset | Log every `AgentServerMessage` case received from Cursor |
 | `CURSOR_LOG_NATIVE_EXEC` | `1` | unset | Log every native exec passthrough event |
@@ -91,6 +95,76 @@ context handling depends on this flag.
   full prior history). Fine for typical claude-code sessions (10-30
   turns); gets expensive at 100+.
 
+## Thinking continuity
+
+Enable with `POOL_REINJECT_THINKING=1`. Captures Cursor's `thinking_delta`
+events into a per-`convKey` server-side buffer, then renders them as
+`<thinking>…</thinking>` text into the next turn's outbound prompt for
+that same conversation. Pool-side counterpart of `server.js`'s
+`CURSOR_REINJECT_THINKING`; same mechanism, different process boundary.
+
+### Why this exists
+
+The model's *own* prior reasoning ordinarily lives in the server-side
+Cursor model context for the open channel. Two situations break that:
+
+- **`full` mode + LRU rotation** — turn 2 of a conversation may land on a
+  different channel from turn 1. The new channel has no memory of what
+  turn 1's model thought.
+- **`last` mode + same-channel-different-conversation** — across truly
+  unrelated conversations served by the same channel, prior thinking is
+  noise rather than help (this case already works without reinjection;
+  no change).
+
+Either path, the captured-then-rendered `<thinking>…</thinking>` is the
+only way to give the model a useful reasoning carry-over within the
+existing wire constraints (Cursor's transport strips signed extended-
+thinking blocks regardless of source — see `DEVLOG.md` "Proxy-side
+thinking re-injection" for that constraint).
+
+### How conversations are identified
+
+This depends on the convKey identity fix that landed earlier in this
+project: `extractClientSessionId(req)` pulls a stable per-conversation
+UUID from either the `x-claude-code-session-id` header or
+`body.metadata.user_id`'s `session_id` field. `deriveConversationKey`
+hashes only `(modelId, sessionId)` when that UUID is present, producing
+a `conv-v2:` key with zero collision risk across distinct conversations
+even when prompts and tools are identical. Non-claude-code callers
+fall back to the legacy circumstantial hash.
+
+### Trade-off
+
+- ✅ Survives both LRU rotation in `full` mode and channel reuse across
+  conversations in `last` mode.
+- ✅ Bounded: `MAX_BYTES_PER_TURN × MAX_TURNS` = 4 KB × 5 = 20 KB cap on
+  injected thinking per `convKey`.
+- ✅ Default off — opt-in symmetry with `CURSOR_REINJECT_THINKING`.
+- ❌ Text-form continuity, NOT native signed extended-thinking. The model
+  sees prior reasoning as inline `<thinking>` tags, treats it as
+  reference context — does not run it through extended-thinking re-
+  validation logic on Cursor's side. Same approximation `server.js`
+  ships, same caveat.
+- ❌ Some extra prompt bytes per continuation; bounded by the env caps.
+
+### Verifying it works
+
+```bash
+node scaffolding/pool/thinking-buffer-test.mjs      # 34 unit assertions
+node scaffolding/pool/reinject-thinking-test.mjs    # 2-turn E2E
+```
+
+The E2E test asserts on the **outbound prompt to the bridge** containing
+a `<thinking>` block on turn 2 — model-output coherence is a separate
+concern verified by `multi-turn-test.mjs`.
+
+If `POOL_REINJECT_THINKING_DEBUG=1`, the api-server exposes:
+
+| Endpoint | What it returns |
+|---|---|
+| `GET /v1/_debug/thinking_buffer` | Live buffer contents per convKey |
+| `POST /v1/_debug/render` | Render a fake POST body through the same pipeline to inspect what would be sent |
+
 ### Verifying it works
 
 ```bash
@@ -118,6 +192,10 @@ All three should PASS in the recommended config (`h1 + translate + full`).
   model id, empty `input_json_delta` preamble).
 - ✅ **`ExecClientControlMessage(streamClose)`** sent after every tool
   result — matches Cursor IDE's bundle pattern.
+- ✅ **Thinking continuity** (`POOL_REINJECT_THINKING=1`, opt-in) —
+  captured per `convKey` (using `x-claude-code-session-id` for ironclad
+  attribution), reinjected as `<thinking>…</thinking>` text on
+  subsequent turns. Mirrors `server.js`'s `CURSOR_REINJECT_THINKING`.
 
 See `H1_RESULTS.md` for the scale-test results (10 channels @ H1: 0
 hard rate-limit hits vs 108 on H2). See `TOOL_USE_HANG_FINDINGS.md`

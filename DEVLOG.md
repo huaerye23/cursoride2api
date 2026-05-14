@@ -1409,9 +1409,31 @@ claude-code is built on `@anthropic-ai/sdk`. Its `Usage` type declares six requi
 
 Before this, claude-code received the tool_use and silently dropped it without ever POSTing back a tool_result.
 
+### `POOL_REINJECT_THINKING` — pool-side port of the thinking-continuity workaround (commits `aa7cd5c`, `c58b19e`, `d2f9135`)
+
+The pool's `full` mode renders the entire `messages[]` history on every turn so multi-turn conversations survive LRU channel rotation. But the model's **own prior reasoning** (extended-thinking tokens) lives only in the server-side Cursor model context — and rotation drops that context. `POOL_REINJECT_THINKING=1` is the pool-side equivalent of `server.js`'s `CURSOR_REINJECT_THINKING`: capture `thinking_delta` per `convKey`, re-render as `<thinking>…</thinking>` text on the next turn.
+
+**Why the simpler "render claude-code's echoed thinking blocks" approach doesn't work**: claude-code only echoes thinking blocks it has previously received. Both `server.js` and the pool's bridge-worker default `_emitThinkingBlocks = false` (and the pool's bridge-worker further drops `onThinkingDelta` callbacks at the IPC layer) precisely *because* emitting unsigned thinking would corrupt claude-code's session file for portability — if the user later switches that session to direct Anthropic, the API rejects with `400 Invalid signature in thinking block`. So there is nothing to echo, and that path is closed by design.
+
+**Why the wire-stripping concern is partial**: Cursor's transport strips *signed* extended-thinking semantics regardless of source. But the *text* content passes through fine — that's exactly what `CURSOR_REINJECT_THINKING` exploits in `server.js` and what `POOL_REINJECT_THINKING` exploits in the pool. Both produce identical wire content (text-form `<thinking>` blocks inside the rendered prompt); they differ only in which side captures the content.
+
+**The convKey identity problem was a real blocker** — addressed earlier in commit `b879706`. The legacy circumstantial hash (`first 200 chars of user msg + system + tools + remoteAddr + remotePort`) collides for any two conversations that start with identical prompts and share a keep-alive socket. `extractClientSessionId(req)` reads claude-code's `x-claude-code-session-id` header (or the `session_id` inside `body.metadata.user_id`); when present, `deriveConversationKey` emits a `conv-v2:` prefixed hash from `(modelId, sessionId)` only — bulletproof per-conversation attribution. Without this fix, the reinjection buffer would have cross-contaminated unrelated sessions.
+
+**Implementation summary**:
+
+- `scaffolding/pool/thinking-buffer.mjs` (new, ~168 lines) — bounded per-`convKey` ring buffer with `append` / `commitTurn` / `getForConvKey` / TTL eviction. Pure ESM port of `src/thinking-history.js`'s pattern; chosen over cross-language import because the env-var namespace differs and the module is small.
+- `bridge-worker.mjs` — `onThinkingDelta` un-suppressed in both `openOnce` and `attachLiveCallbacks`; forwards `{type:'thinking_delta', requestId, text}` IPC to pool-manager.
+- `pool-manager.mjs` — `thinking_delta` added as a forward case parallel to `text_delta`; env propagated to workers via spawn-env (`POOL_REINJECT_THINKING: '0'|'1'`).
+- `api-server.mjs` — captures thinking_delta into the per-convKey buffer, commits on `finishMessage`, and in `renderFullContext` prepends stored thinking to each prior assistant turn's body (full mode) or as a preamble before the last user message text (last mode). Imports `extractClientSessionId` + `deriveConversationKey` from `src/anthropic-tools.js` via `createRequire` (CJS bridge from ESM).
+- Tests: `thinking-buffer-test.mjs` (34 unit assertions covering bounds, TTL, eviction, multi-convKey isolation, scrubbing) + `reinject-thinking-test.mjs` (2-turn E2E asserting on **outbound prompt to bridge** containing `<thinking>` markers — model-output coherence verified separately by `multi-turn-test.mjs`).
+
+**Bounds**: same defaults as `CURSOR_REINJECT_THINKING` — 4 KB per turn, 5 turns retained, 30-min TTL. Env-overridable via `POOL_REINJECT_THINKING_MAX_BYTES_PER_TURN` and `POOL_REINJECT_THINKING_MAX_TURNS`.
+
+**Trade-off documented in the test report**: empty-tools probes (claude-code's parallel `tools=[]` + `tools=N` pattern) share the same convKey under conv-v2 and both produce `commitTurn` invocations. Probes typically yield empty thinking content, so the stored turns are dropped to `''` and don't pollute storage. Not a bug, just an observed property.
+
 ### Orthogonality to root `server.js`
 
-The RATLC pool's `api-server.mjs` is a clean parallel implementation; it shares only `src/cursor-agent.js` (and the new `src/cursor-agent-h1.js`) with `server.js`. Features like `CURSOR_REINJECT_THINKING`, `MAX_TOTAL_BYTES`, the per-stream `pendingToolCalls` rescue, etc., live entirely in `server.js` and do **not** affect the pool. Conversely, `POOL_*` env vars and the warm-channel architecture are pool-only.
+The RATLC pool's `api-server.mjs` is a clean parallel implementation; it shares `src/cursor-agent.js` / `src/cursor-agent-h1.js` (transport) and now `src/anthropic-tools.js` (convKey + session-id extraction). `server.js`'s `CURSOR_REINJECT_THINKING` and the pool's `POOL_REINJECT_THINKING` are sibling features pointing at the same wire constraint from different process boundaries — they don't interact at runtime (different listeners, different storage).
 
 If you switch between the two, only one server should listen on `:4242` at a time.
 
