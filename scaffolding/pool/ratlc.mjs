@@ -8,11 +8,14 @@
 //   watch [interval]     Refreshing status (existing behavior)
 //   tui                  Full-screen dashboard with hotkeys (r/R/k/q)
 //   tail                 Live-tail pool log, filtered to significant events
-//   ramp <N>             Add N channels (positive) or remove |N| (negative)
+//   ramp <N> [--group=M] Add N channels (positive) or remove |N| (negative); --group defaults to default group
 //   restart [<ch>]       Restart specific channel (or any-stuck one if omitted)
 //   metrics              JSON metrics snapshot
-//   claude [args...]     Spawn claude-code with auto-wait-for-ready + correct env
+//   claude [--model X] [args...]   Spawn claude-code with auto-wait-for-ready + ANTHROPIC_MODEL forwarded
 //   logs                 Print log file paths
+//   groups               Print per-group breakdown
+//   add-group <model> <N>   Register a new model group with target N channels
+//   remove-group <model>    Drain & remove a non-default model group
 //
 // Env vars (forwarded when up):
 //   POOL_SIZE                Default 2
@@ -79,6 +82,10 @@ function poolRequest(obj, timeoutMs = 5000) {
 }
 
 async function getStatus() { return poolRequest({ type: 'status' }); }
+async function getGroups() {
+  const r = await poolRequest({ type: 'list_groups' });
+  return r?.groups || [];
+}
 
 async function getHealth() {
   return new Promise((resolve, reject) => {
@@ -203,17 +210,38 @@ function printStatus(snap) {
     `dead=${color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray)}`,
   ].join('  ');
   console.log(`Pool: ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
-  console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  Model: ${config.model}  concurrent_opens=${config.concurrentOpens || 1}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}`);
+  const groupCount = (pool.groups || []).length;
+  console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  groups=${groupCount} (default=${pool.defaultGroup || config.model})  concurrent_opens=${config.concurrentOpens || 1}  group_wait_ms=${config.groupWaitMs ?? '-'}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}`);
+  if (pool.groups?.length) {
+    console.log('');
+    const ghdr = ['GROUP', 'TARGET', 'READY', 'BUSY', 'OPEN', 'DEAD', 'ROUNDS'];
+    const gw = [42, 7, 7, 6, 6, 6, 7];
+    console.log(ghdr.map((h, i) => color(h.padEnd(gw[i]), ANSI.bold)).join(' '));
+    for (const g of pool.groups) {
+      const tag = g.isDefault ? '* ' : '  ';
+      const drain = g.draining ? color(' [drain]', ANSI.red) : '';
+      const row = [
+        (tag + g.model).padEnd(gw[0] - 0) + drain,
+        String(g.target).padEnd(gw[1]),
+        color(String(g.ready).padEnd(gw[2]), ANSI.green),
+        color(String(g.busy).padEnd(gw[3]), ANSI.yellow),
+        color(String(g.opening).padEnd(gw[4]), ANSI.cyan),
+        color(String(g.dead).padEnd(gw[5]), g.dead ? ANSI.red : ANSI.gray),
+        String(g.rounds).padEnd(gw[6]),
+      ];
+      console.log(row.join(' '));
+    }
+  }
   console.log('');
   if (!pool.channels?.length) { console.log(color('  (no channels)', ANSI.dim)); return; }
-  const headers = ['CHANNEL', 'STATE', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT', 'ERROR'];
-  const widths = [10, 9, 7, 9, 8, 8, 8, 22, 30];
+  const headers = ['CHANNEL', 'STATE', 'GROUP', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT', 'ERROR'];
+  const widths = [10, 9, 36, 7, 9, 8, 8, 8, 22, 30];
   console.log(headers.map((h, i) => h.padEnd(widths[i])).join('  '));
-  console.log('─'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
+  console.log('-'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
   for (const ch of pool.channels) {
     const c = STATE_COLOR[ch.state] || '';
     const row = [
-      ch.id, c + ch.state + ANSI.reset, String(ch.pid || '-'),
+      ch.id, c + ch.state + ANSI.reset, ch.group || '-', String(ch.pid || '-'),
       String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
       String(ch.roundsServed || 0),
       ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
@@ -519,11 +547,26 @@ async function cmdTail() {
 
 // ── ramp ────────────────────────────────────────────────────────────────
 async function cmdRamp(args) {
-  const n = parseInt(args[0] || '1', 10);
-  if (!Number.isFinite(n) || n === 0) { console.error('usage: ratlc ramp <±N>'); process.exit(1); }
-  const r = n > 0
-    ? await poolRequest({ type: 'ramp_up', count: n })
-    : await poolRequest({ type: 'ramp_down', count: -n });
+  let group = null;
+  const positional = [];
+  for (const a of args) {
+    if (a.startsWith('--group=')) group = a.slice('--group='.length);
+    else positional.push(a);
+  }
+  const n = parseInt(positional[0] || '1', 10);
+  if (!Number.isFinite(n) || n === 0) {
+    console.error('usage: ratlc ramp <\u00b1N> [--group=<model>]');
+    process.exit(1);
+  }
+  const req = n > 0
+    ? { type: 'ramp_up', count: n }
+    : { type: 'ramp_down', count: -n };
+  if (group) req.group = group;
+  const r = await poolRequest(req);
+  if (r?.type === 'error') {
+    console.error(color('error: ' + (r.message || 'unknown'), ANSI.red));
+    process.exit(1);
+  }
   console.log(r.message || JSON.stringify(r));
 }
 
@@ -538,6 +581,61 @@ async function cmdRestart(args) {
     return console.log(r.message || JSON.stringify(r));
   }
   const r = await poolRequest({ type: 'restart_channel', channelId: id });
+  console.log(r.message || JSON.stringify(r));
+}
+
+// ── groups ──────────────────────────────────────────────────────────────
+async function cmdGroups() {
+  let r;
+  try { r = await poolRequest({ type: 'list_groups' }); }
+  catch (e) { console.error(color('pool unreachable: ' + e.message, ANSI.red)); process.exit(1); }
+  const list = r?.groups || [];
+  if (!list.length) { console.log(color('(no groups)', ANSI.dim)); return; }
+  const headers = ['GROUP', 'TARGET', 'READY', 'BUSY', 'OPEN', 'DEAD', 'ROUNDS', ''];
+  const w = [44, 7, 7, 6, 6, 6, 7, 8];
+  console.log(headers.map((h, i) => color(h.padEnd(w[i]), ANSI.bold)).join(' '));
+  for (const g of list) {
+    const tag = g.isDefault ? color('default', ANSI.cyan) : '       ';
+    const drain = g.draining ? color('drain', ANSI.red) : '';
+    console.log([
+      (g.model + (g.isDefault ? ' (default)' : '')).padEnd(w[0]),
+      String(g.target).padEnd(w[1]),
+      color(String(g.ready).padEnd(w[2]), ANSI.green),
+      color(String(g.busy).padEnd(w[3]), ANSI.yellow),
+      color(String(g.opening).padEnd(w[4]), ANSI.cyan),
+      color(String(g.dead).padEnd(w[5]), g.dead ? ANSI.red : ANSI.gray),
+      String(g.rounds).padEnd(w[6]),
+      drain,
+    ].join(' '));
+  }
+}
+
+async function cmdAddGroup(args) {
+  const model = args[0];
+  const size = parseInt(args[1] || '0', 10);
+  if (!model || !Number.isFinite(size) || size < 0) {
+    console.error('usage: ratlc add-group <model> <N>');
+    process.exit(1);
+  }
+  const r = await poolRequest({ type: 'add_group', model, size });
+  if (r?.type === 'error') {
+    console.error(color('error: ' + (r.message || 'unknown'), ANSI.red));
+    process.exit(1);
+  }
+  console.log(r.message || JSON.stringify(r));
+}
+
+async function cmdRemoveGroup(args) {
+  const model = args[0];
+  if (!model) {
+    console.error('usage: ratlc remove-group <model>');
+    process.exit(1);
+  }
+  const r = await poolRequest({ type: 'remove_group', model });
+  if (r?.type === 'error') {
+    console.error(color('error: ' + (r.message || 'unknown'), ANSI.red));
+    process.exit(1);
+  }
   console.log(r.message || JSON.stringify(r));
 }
 
@@ -561,19 +659,51 @@ async function cmdMetrics() {
 
 // ── claude wrapper ──────────────────────────────────────────────────────
 async function cmdClaude(args) {
-  console.log(color('▸ waiting for at least 1 channel ready...', ANSI.gray));
+  // Pull out --model X (or --model=X) from the args we forward. If
+  // present, refuse to launch unless a matching group exists (decision
+  // §9.4 in MULTI_GROUP_PLAN.md). The flag is also forwarded to claude
+  // and used to set ANTHROPIC_MODEL so the request body actually carries
+  // the model.
+  let targetModel = null;
+  const passArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--model' && i + 1 < args.length) { targetModel = args[i + 1]; passArgs.push(a, args[i + 1]); i++; }
+    else if (a.startsWith('--model=')) { targetModel = a.slice('--model='.length); passArgs.push(a); }
+    else passArgs.push(a);
+  }
+  if (targetModel) {
+    let known;
+    try { known = await getGroups(); } catch (e) {
+      console.error(color('error: cannot reach pool to verify --model ' + targetModel + ': ' + e.message, ANSI.red));
+      process.exit(1);
+    }
+    const match = known.find((g) => g.model === targetModel);
+    if (!match) {
+      const list = known.map((g) => g.model + (g.isDefault ? ' (default)' : '')).join(', ');
+      console.error(color('error: no group for model ' + targetModel + '. Known: ' + (list || '(none)'), ANSI.red));
+      console.error(color('hint: ratlc add-group ' + targetModel + ' 2', ANSI.dim));
+      process.exit(1);
+    }
+  }
+  console.log(color('▸ waiting for at least 1 channel ready' + (targetModel ? ' on group ' + targetModel : '') + '...', ANSI.gray));
   let waited = 0;
   while (true) {
     try {
       const h = await getHealth();
-      const ready = h?.pool?.readyCount || 0;
-      if (ready >= 1) {
-        console.log(color(`✅ pool ready (${ready}/${h.pool.actualSize}), launching claude...`, ANSI.green));
+      const allReady = h?.pool?.readyCount || 0;
+      let groupReady = allReady;
+      if (targetModel) {
+        const g = (h?.pool?.groups || []).find((x) => x.model === targetModel);
+        groupReady = g ? g.ready : 0;
+      }
+      if (groupReady >= 1) {
+        console.log(color('✅ pool ready (' + groupReady + ' ready' + (targetModel ? ' on ' + targetModel : '') + '), launching claude...', ANSI.green));
         break;
       }
     } catch {}
     if (waited > 600) {
-      console.error(color('❌ pool didn\'t reach ready=1 in 10 minutes', ANSI.red));
+      console.error(color('❌ pool did not reach ready>=1 in 10 minutes', ANSI.red));
       process.exit(1);
     }
     process.stdout.write('.');
@@ -581,13 +711,13 @@ async function cmdClaude(args) {
     waited += 2;
   }
   console.log('');
-  // exec claude with the right env
   const env = {
     HOME: process.env.HOME, PATH: process.env.PATH, TERM: process.env.TERM || 'xterm',
     ANTHROPIC_BASE_URL: API_URL,
     ANTHROPIC_API_KEY: 'ratlc-pool',
   };
-  const child = spawn(process.env.CLAUDE_BIN || 'claude', args, {
+  if (targetModel) env.ANTHROPIC_MODEL = targetModel;
+  const child = spawn(process.env.CLAUDE_BIN || 'claude', passArgs, {
     env, stdio: 'inherit',
   });
   child.on('exit', (code) => process.exit(code || 0));
@@ -612,6 +742,9 @@ const [, , cmd, ...rest] = process.argv;
       case 'ramp': return await cmdRamp(rest);
       case 'restart': case 'restart-channel': return await cmdRestart(rest);
       case 'metrics': return await cmdMetrics();
+      case 'groups': return await cmdGroups();
+      case 'add-group': return await cmdAddGroup(rest);
+      case 'remove-group': return await cmdRemoveGroup(rest);
       case 'claude': return await cmdClaude(rest);
       case 'logs': return await cmdLogs();
       default:
@@ -622,17 +755,22 @@ const [, , cmd, ...rest] = process.argv;
   ratlc watch [interval]      Auto-refreshing snapshot
   ratlc tui                   Full-screen dashboard (hotkeys r/R/k/q)
   ratlc tail                  Live-tail pool + api logs
-  ratlc ramp <±N>             Add/remove channels
+  ratlc ramp <±N> [--group=M]   Add/remove channels on group M (default group if omitted)
   ratlc restart [<ch>]        Restart specific channel (or any stuck one)
   ratlc metrics               JSON metrics
-  ratlc claude [args...]      Auto-wait then spawn claude-code with right env
+  ratlc groups                Per-group breakdown
+  ratlc add-group <model> <N> Register a new model group with target N channels
+  ratlc remove-group <model>  Drain & remove a non-default model group
+  ratlc claude [--model X] [args...]  Auto-wait then spawn claude-code (ANTHROPIC_MODEL forwarded)
   ratlc logs                  Show log file paths
 
 Env vars for 'up':
-  POOL_SIZE=2                                 channels target
+  POOL_SIZE=2                                 default-group channel target
   POOL_TOOL_MODE=contract|translate           default contract
   POOL_CONCURRENT_OPENS=1                     bump to 2-3 for faster bring-up
-  POOL_MODEL=claude-opus-4-7-thinking-max-fast
+  POOL_MODEL=claude-opus-4-7-thinking-max-fast  default group model
+  POOL_GROUPS=modelA:3,modelB:2               extra groups at boot (comma-separated model:size)
+  POOL_GROUP_WAIT_MS=5000                     ms a request waits for its target group before fallback
   TOOL_INCLUDE=Bash,Read,Edit,...             contract mode tool filter
 `);
         process.exit(cmd ? 1 : 0);
