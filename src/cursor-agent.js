@@ -2022,4 +2022,15 @@ module.exports = {
   buildHeaders,
   loadProto,
   prewarmSharedClient,
+  // Shared helpers exposed for src/cursor-agent-h1.js (H1 transport variant).
+  // These are the transport-agnostic message decoders/encoders; the H1
+  // module imports them so the protocol-level behavior stays identical
+  // across H2 and H1 paths. Do NOT remove without updating cursor-agent-h1.js.
+  buildMcpToolDefinitions,
+  handleExecMessage,
+  handleKvMessage,
+  handleInteractionQuery,
+  sendExecClientMessage,
+  sendKvResponse,
+  frameConnectMessage,
 };
