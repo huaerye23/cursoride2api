@@ -240,14 +240,20 @@ async function cmdWatch(interval = 2) {
   }
 }
 
-// ── TUI mode (split-screen: dashboard + live api log) ───────────────────
+// ── TUI mode (split-screen + ':'-style command bar) ─────────────────────
 async function cmdTui() {
   process.stdout.write(ANSI.altScreen + ANSI.hideCursor);
 
-  const apiLines = [];           // raw api log lines (full)
-  const poolLines = [];          // raw pool log lines
+  const apiLines = [];
+  const poolLines = [];
   let dirty = true;
   let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status'
+  let cmdMode = false;           // vim-style ':' command input
+  let cmdBuffer = '';
+  let cmdHistory = [];
+  let cmdHistoryIdx = -1;
+  let cmdResult = '';            // last-action feedback shown below the bar
+  let pendingEsc = false;        // track escape sequence parse
 
   const tailApi = spawn('tail', ['-F', '-n', '50', API_LOG]);
   tailApi.stdout.on('data', (chunk) => {
@@ -282,23 +288,105 @@ async function cmdTui() {
   } else {
     console.log(color('(stdin not a TTY — running view-only, no hotkeys)', ANSI.dim));
   }
-  process.stdin.on('data', async (key) => {
-    if (key === 'q' || key === '\u0003') return exitTui(0);
+
+  async function executeCommand(line) {
+    const parts = line.split(/\s+/).filter(Boolean);
+    const sub = parts[0];
+    const args = parts.slice(1);
+    cmdResult = '▸ ' + line;
+    dirty = true;
+    const ratlcBin = process.argv[1];
+    function spawnRatlc(subArgs, env) {
+      const child = spawn(process.execPath, [ratlcBin, ...subArgs], {
+        env: env || process.env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      child.stdout?.on('data', (d) => { out += d.toString(); });
+      child.stderr?.on('data', (d) => { out += d.toString(); });
+      child.on('exit', (code) => {
+        const tail = out.trim().split('\n').slice(-1)[0] || '';
+        cmdResult = (code === 0 ? '✓ ' : '✗ exit ' + code + ' ') + line + (tail ? ' — ' + tail.slice(0, 80) : '');
+        dirty = true;
+      });
+    }
+    if (sub === 'down' || sub === 'stop') { spawnRatlc(['down']); return; }
+    if (sub === 'up' || sub === 'start') {
+      const env = { ...process.env };
+      let size = null;
+      for (const a of args) {
+        if (a === 'translate' || a === 'contract') env.POOL_TOOL_MODE = a;
+        else if (/^\d+$/.test(a)) size = a;
+        else if (a.startsWith('mode=')) env.POOL_TOOL_MODE = a.split('=')[1];
+        else if (a.startsWith('concurrent=') || a.startsWith('parallel=')) env.POOL_CONCURRENT_OPENS = a.split('=')[1];
+        else if (a.startsWith('model=')) env.POOL_MODEL = a.split('=')[1];
+        else if (a.startsWith('include=')) env.TOOL_INCLUDE = a.split('=')[1];
+      }
+      spawnRatlc(size ? ['up', size] : ['up'], env);
+      return;
+    }
+    if (sub === 'ramp') {
+      if (!args.length) { cmdResult = 'usage: ramp <±N>'; dirty = true; return; }
+      spawnRatlc(['ramp', args[0]]);
+      return;
+    }
+    if (sub === 'restart') { spawnRatlc(['restart', ...args]); return; }
+    if (sub === 'help' || sub === '?') {
+      cmdResult = 'cmds: down · up [N] [translate|contract] [concurrent=N] [include=...] · ramp ±N · restart [ch-N] · help · q';
+      dirty = true;
+      return;
+    }
+    if (sub === 'claude') { cmdResult = '(run `ratlc claude` from a separate terminal)'; dirty = true; return; }
+    cmdResult = '? unknown: ' + sub + ' (try :help)'; dirty = true;
+  }
+
+  function onKey(key) {
+    if (cmdMode) {
+      // Handle ANSI escape sequences for arrow keys / Esc
+      if (pendingEsc) {
+        pendingEsc = false;
+        if (key === '[A') { // up
+          if (cmdHistoryIdx < cmdHistory.length - 1) { cmdHistoryIdx++; cmdBuffer = cmdHistory[cmdHistoryIdx] || ''; dirty = true; }
+          return;
+        }
+        if (key === '[B') { // down
+          if (cmdHistoryIdx > 0) { cmdHistoryIdx--; cmdBuffer = cmdHistory[cmdHistoryIdx] || ''; }
+          else if (cmdHistoryIdx === 0) { cmdHistoryIdx = -1; cmdBuffer = ''; }
+          dirty = true;
+          return;
+        }
+        // ESC pressed alone — cancel
+        cmdMode = false; cmdBuffer = ''; cmdHistoryIdx = -1; dirty = true;
+        return;
+      }
+      if (key === '') { pendingEsc = true; return; }
+      if (key === '\r' || key === '\n') {
+        const line = cmdBuffer.trim();
+        cmdMode = false; cmdBuffer = ''; cmdHistoryIdx = -1; dirty = true;
+        if (line) { cmdHistory.unshift(line); cmdHistory = cmdHistory.slice(0, 50); executeCommand(line); }
+        return;
+      }
+      if (key === '' || key === '\b') { cmdBuffer = cmdBuffer.slice(0, -1); dirty = true; return; }
+      if (key.length === 1 && key >= ' ' && key < '') { cmdBuffer += key; dirty = true; return; }
+      return;
+    }
+    // Normal-mode hotkeys
+    if (key === 'q' || key === '') return exitTui(0);
+    if (key === ':') { cmdMode = true; cmdBuffer = ''; cmdHistoryIdx = -1; dirty = true; return; }
     if (key === '1') { viewMode = 'split'; dirty = true; return; }
     if (key === '2') { viewMode = 'api'; dirty = true; return; }
     if (key === '3') { viewMode = 'pool'; dirty = true; return; }
     if (key === '4') { viewMode = 'status'; dirty = true; return; }
-    if (key === 'r') { try { await poolRequest({ type: 'ramp_up', count: 1 }); } catch {} dirty = true; return; }
-    if (key === 'R') { try { await poolRequest({ type: 'ramp_down', count: 1 }); } catch {} dirty = true; return; }
+    if (key === 'r') { poolRequest({ type: 'ramp_up', count: 1 }).then(() => { cmdResult = '✓ ramp +1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp+1: ' + e.message; dirty = true; }); return; }
+    if (key === 'R') { poolRequest({ type: 'ramp_down', count: 1 }).then(() => { cmdResult = '✓ ramp -1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp-1: ' + e.message; dirty = true; }); return; }
     if (key === 'k') {
-      try {
-        const s = await getStatus();
+      getStatus().then((s) => {
         const c = s.pool.channels.find((c) => c.state === 'opening' || c.state === 'dead') || s.pool.channels[0];
-        if (c) await poolRequest({ type: 'restart_channel', channelId: c.id });
-      } catch {}
-      dirty = true; return;
+        if (c) return poolRequest({ type: 'restart_channel', channelId: c.id }).then(() => { cmdResult = '✓ restart ' + c.id; });
+      }).catch((e) => { cmdResult = '✗ restart: ' + e.message; }).finally(() => { dirty = true; });
+      return;
     }
-  });
+  }
+  if (process.stdin.isTTY) process.stdin.on('data', onKey);
 
   function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ''); }
   function rpad(s, n) { return s + ' '.repeat(Math.max(0, n - stripAnsi(s).length)); }
@@ -315,7 +403,6 @@ async function cmdTui() {
     ].join('  ');
     out.push('Pool ' + color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold) + '  ' + counts + '  pending=' + pool.pendingRequests + '  tool_use_held=' + pool.toolUseIndex);
     out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
-
     if (pool.readyCount >= 1) {
       out.push(color('▶ READY — you can run: ratlc claude', ANSI.green + ANSI.bold));
     } else if (pool.openingCount > 0) {
@@ -326,7 +413,6 @@ async function cmdTui() {
       out.push(color('▶ NOT READY — no channels opening; check status', ANSI.red + ANSI.bold));
     }
     out.push('');
-
     if (pool.channels?.length) {
       const w = [10, 10, 8, 9, 8, 8, 7, 22];
       const hdr = ['CHANNEL', 'STATE', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
@@ -357,7 +443,7 @@ async function cmdTui() {
     return [
       color('ratlc tui', ANSI.bold) + '  ' + color(ts, ANSI.dim) +
       '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') +
-      '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[q]', ANSI.cyan) + ' quit',
+      '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[:]', ANSI.cyan) + ' cmd ' + color('[q]', ANSI.cyan) + ' quit',
       color('─'.repeat(Math.max(1, (process.stdout.columns || 100) - 1)), ANSI.dim),
     ];
   }
@@ -369,6 +455,18 @@ async function cmdTui() {
     for (const l of lines) out.push(color('  ' + l.slice(0, cols - 4), ANSI.dim));
     while (out.length < height) out.push('');
     return out;
+  }
+
+  function drawCmdBar(cols) {
+    console.log(color('─'.repeat(Math.max(1, cols - 1)), ANSI.dim));
+    if (cmdMode) {
+      process.stdout.write(color(':', ANSI.cyan + ANSI.bold) + cmdBuffer + color('▎', ANSI.cyan) + '\n');
+    } else {
+      const hint = cmdResult
+        ? color(cmdResult, ANSI.green)
+        : color("press ':' for command (e.g. :up 10 translate, :down, :ramp +3, :help)", ANSI.dim);
+      console.log(hint);
+    }
   }
 
   async function render() {
@@ -383,32 +481,35 @@ async function cmdTui() {
     const hdr = header(ts);
     for (const line of hdr) console.log(line);
 
+    // command bar takes 2 lines at the bottom
+    const cmdBarLines = 2;
+
     if (viewMode === 'status') {
       for (const l of buildStatusLines(snap)) console.log(l);
-      return;
+      drawCmdBar(cols); return;
     }
     if (viewMode === 'api') {
-      for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', rows - hdr.length - 1)) console.log(l);
-      return;
+      for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', rows - hdr.length - cmdBarLines)) console.log(l);
+      drawCmdBar(cols); return;
     }
     if (viewMode === 'pool') {
-      for (const l of logPaneLines(poolLines, '/tmp/ratlc-pool.log', rows - hdr.length - 1)) console.log(l);
-      return;
+      for (const l of logPaneLines(poolLines, '/tmp/ratlc-pool.log', rows - hdr.length - cmdBarLines)) console.log(l);
+      drawCmdBar(cols); return;
     }
-    // split (default)
+    // split
     const statusLines = buildStatusLines(snap);
     const minStatusHeight = Math.max(statusLines.length, 12);
     for (let i = 0; i < minStatusHeight; i++) console.log(statusLines[i] ?? '');
     console.log(color('─'.repeat(Math.max(1, cols - 1)), ANSI.dim));
-    const apiPaneHeight = Math.max(5, rows - hdr.length - minStatusHeight - 2);
+    const apiPaneHeight = Math.max(5, rows - hdr.length - minStatusHeight - cmdBarLines - 2);
     for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', apiPaneHeight)) console.log(l);
+    drawCmdBar(cols);
   }
 
   setInterval(() => { dirty = true; }, 1000);
   setInterval(render, 250);
   await render();
 }
-
 // ── tail (filtered) ──────────────────────────────────────────────────────
 async function cmdTail() {
   console.log(color(`tailing ${POOL_LOG} + ${API_LOG} (Ctrl+C to stop)`, ANSI.dim));
