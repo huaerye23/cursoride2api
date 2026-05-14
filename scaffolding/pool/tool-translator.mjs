@@ -156,21 +156,30 @@ export function anthropicResultToCursor(anthropicName, content) {
 }
 
 // ── 4. Pool-open tool list for TRANSLATE mode ───────────────────────────
-// Cursor only injects its default toolset when our `tools` is non-empty.
-// So we always register: bajie_yield + a tiny placeholder. The placeholder
-// has a stable signature so the pool contract never changes regardless of
-// what the caller sends.
+// Empirical observation: Cursor's backend injects its full default agent
+// toolset into the model's prompt only when the caller registers at least
+// one non-trivial-looking tool via mcpToolDefs. Tools whose names start
+// with our internal `bajie_` prefix don't seem to trigger the injection
+// (Cursor likely treats them as internal). Tools with empty schemas may
+// also be skipped. We register a tool with a generic, non-internal-looking
+// name and a real schema property so Cursor's injection logic kicks in.
 export function defaultTranslateModeTools() {
   return [
     {
-      name: 'bajie_relay_placeholder',
-      description: 'Internal placeholder for the proxy. Do not call this tool.',
-      input_schema: { type: 'object', properties: {}, required: [] },
+      name: 'search_codebase',
+      description:
+        'Search across the codebase. (Proxy-internal placeholder — do not call this; ' +
+        'use the appropriate Cursor-native tool like Grep or Read instead.)',
+      input_schema: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'search query' } },
+        required: ['query'],
+      },
     },
   ];
 }
 
 // Names the model should never directly invoke (proxy-internal).
 export function isInternalTool(name) {
-  return name === 'bajie_yield' || name === 'bajie_relay_placeholder';
+  return name === 'bajie_yield' || name === 'search_codebase';
 }

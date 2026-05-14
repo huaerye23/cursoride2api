@@ -120,6 +120,15 @@ function spawnChannel() {
     // native Cursor tools (Shell/Read/Write/Grep/Fetch) as MCP-shape
     // tool_use events with Anthropic names (Bash/Read/Write/Grep/WebFetch).
     RATLC_PASSTHROUGH_NATIVE: POOL_TOOL_MODE === 'translate' ? '1' : '0',
+    // In translate mode, native tool calls round-trip through the API
+    // client (claude-code), which can take seconds-to-minutes. The
+    // default stall watchdog assumes Cursor will continue emitting
+    // frames; here it has to wait on us. Bump the threshold to 30 min
+    // so the watchdog doesn't trip while we wait on the client.
+    ...(POOL_TOOL_MODE === 'translate' ? {
+      CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT: '1800000',
+      CURSOR_STALL_TIMEOUT_MS: '600000',
+    } : {}),
   };
   const proc = fork(WORKER_SCRIPT, [], { env, silent: false });
   const ch = {

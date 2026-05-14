@@ -193,7 +193,29 @@ function getThreshold(model) {
   const pre  = Math.min(hardCapPre,  Math.round(basePre  * elevation));
   const post = Math.min(hardCapPost, Math.round(basePost * elevation));
 
-  const out = { pre, post, source, elevation };
+  // Honor the documented env-var overrides. These were in the README from
+  // day one but never wired; they're load-bearing for translate-mode
+  // (passthrough native tools), where each round-trip stalls the upstream
+  // waiting on the API client's tool_result and the default 4-5 min cap
+  // is too short.
+  let prePostOverride = false;
+  const envPre = process.env.CURSOR_STALL_TIMEOUT_MS;
+  if (envPre && /^\d+$/.test(envPre)) {
+    const v = parseInt(envPre, 10);
+    if (v > 0) { /* applied below */ prePostOverride = true; }
+  }
+  const envPost = process.env.CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT;
+  let finalPre = pre, finalPost = post, finalSource = source;
+  if (envPre && /^\d+$/.test(envPre)) {
+    const v = parseInt(envPre, 10);
+    if (v > 0) { finalPre = v; finalSource = 'env-override'; }
+  }
+  if (envPost && /^\d+$/.test(envPost)) {
+    const v = parseInt(envPost, 10);
+    if (v > 0) { finalPost = v; finalSource = 'env-override'; }
+  }
+
+  const out = { pre: finalPre, post: finalPost, source: finalSource, elevation };
   if (s) {
     if (s.samples.length >= ADAPTIVE_MIN_SAMPLES) {
       out.p99 = _percentile(s.samples, 0.99);

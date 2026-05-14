@@ -73,14 +73,13 @@ function buildPrimingPrompt(system, callerTools) {
   // Cursor only reads tools from requestContextResult ONCE per stream
   // (empirically verified). So tools must be set at open time; the pool
   // manager recycles all channels when a request arrives with a different
-  // tool list.
+  // tool list (in CONTRACT mode) or never recycles (in TRANSLATE mode).
   const lines = ['You are operating in RELAY mode behind a proxy. Each user message will be delivered via the `bajie_yield` tool result.'];
-  if (callerTools && callerTools.length > 0) {
-    lines.push(`Available tools: ${callerTools.map((t) => t.name).join(', ')}, and ${YIELD_TOOL_NAME}.`);
-    lines.push('Use caller tools when the task requires them. Skip them when not needed.');
-  } else {
-    lines.push(`The only tool you have is ${YIELD_TOOL_NAME}.`);
-  }
+  // Be PERMISSIVE about the tool list: do not declare "your only tools are X
+  // and Y". The model has the explicit tool list in its prompt; we want it
+  // to feel free to use whatever's there, including Cursor's native built-ins
+  // (Shell, Read, Write, Grep, ...) that get auto-injected alongside ours.
+  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND any Cursor-native built-ins (such as Shell/Read/Write/Grep/Glob/WebFetch/etc.) that may be present.');
   lines.push(`At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`);
   lines.push('The bajie_yield tool result is the next user message verbatim.');
   lines.push('Never end your turn without calling bajie_yield. Never produce text outside of a normal response.');

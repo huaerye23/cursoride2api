@@ -734,6 +734,17 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
     return 'diagnostics';
   }
 
+  // listMcpResourcesExecArgs — the model discovers MCP resources via this
+  // call. We have no MCP servers configured behind the proxy, so return an
+  // empty list. Without a response here the model would wait forever.
+  if (msgCase === 'listMcpResourcesExecArgs') {
+    const result = create(A.ListMcpResourcesExecResultSchema, {
+      success: create(A.ListMcpResourcesSuccessSchema, { resources: [] }),
+    });
+    sendExecClientMessage(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
+    return 'listMcpResources';
+  }
+
   console.log(`[cursor-agent] unhandled exec case=${msgCase} execId=${execId}`);
   return 'unknown';
 }
