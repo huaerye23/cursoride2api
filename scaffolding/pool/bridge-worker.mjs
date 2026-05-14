@@ -13,6 +13,11 @@ const CHANNEL_ID = process.env.RATLC_CHANNEL_ID || 'ch-?';
 const MODEL = process.env.RATLC_MODEL || 'claude-opus-4-7-thinking-max-fast';
 const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '500', 10);
 const OPEN_RETRY_MS = parseInt(process.env.RATLC_OPEN_RETRY_MS || '300', 10);
+// When true, native Cursor tool calls (shellArgs/readArgs/writeArgs/...)
+// are translated to MCP-shape tool_use events under the matching
+// Anthropic name (Bash/Read/Write/...) instead of being rejected.
+// Enabled when the pool runs in POOL_TOOL_MODE=translate.
+const PASSTHROUGH_NATIVE = process.env.RATLC_PASSTHROUGH_NATIVE === '1';
 
 const TOKEN_PATH = new URL('../../token.json', import.meta.url);
 const tokenFile = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
@@ -97,6 +102,7 @@ function openOnce(initialPrompt, allTools) {
       modelId: MODEL,
       tools: allTools,
       maxMode: true,
+      passthroughNativeTools: PASSTHROUGH_NATIVE,
       onTextDelta: (t) => { textBuf += t; },
       onMcpCall: (info) => {
         if (info.toolName === YIELD_TOOL_NAME) {

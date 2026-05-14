@@ -515,13 +515,77 @@ function buildMcpToolDefinitions(mcpToolsRaw) {
 //  ExecServerMessage handling
 // ═══════════════════════════════════════════════
 
-function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
+function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opts) {
   const { create, toBinary, agent } = _requireProto();
   const A = agent;
   const id = execMsg.id;
   const execId = execMsg.execId || '';
   const msgCase = execMsg.message?.case;
   const msgValue = execMsg.message?.value;
+  const passthroughNative = opts && opts.passthroughNativeTools === true;
+  const nativeExecKinds = opts && opts.nativeExecKinds; // Map<execId, 'shell'|'read'|...>
+
+  // ── passthrough native tools ────────────────────────────────────────────
+  // When passthroughNativeTools is enabled, instead of rejecting native tool
+  // calls (shellArgs / readArgs / writeArgs / fetchArgs), translate them to
+  // MCP-shape tool_use events the caller can handle. sendToolResult later
+  // dispatches to the right native result schema by consulting nativeExecKinds.
+  if (passthroughNative && nativeExecKinds) {
+    if (msgCase === 'shellArgs') {
+      const args = {
+        command: msgValue?.command || '',
+        ...(msgValue?.working_directory ? { description: `(cwd: ${msgValue.working_directory})` } : {}),
+      };
+      nativeExecKinds.set(execId, 'shell');
+      onMcpCall({ id, execId, toolCallId: `native-shell-${execId.slice(0, 8)}`, toolName: 'Bash', args });
+      return 'shell-passthrough';
+    }
+    if (msgCase === 'readArgs') {
+      nativeExecKinds.set(execId, 'read');
+      onMcpCall({ id, execId, toolCallId: `native-read-${execId.slice(0, 8)}`, toolName: 'Read', args: { file_path: msgValue?.path || '' } });
+      return 'read-passthrough';
+    }
+    if (msgCase === 'writeArgs') {
+      nativeExecKinds.set(execId, 'write');
+      onMcpCall({
+        id, execId,
+        toolCallId: `native-write-${execId.slice(0, 8)}`,
+        toolName: 'Write',
+        args: { file_path: msgValue?.path || '', content: msgValue?.file_text || '' },
+      });
+      return 'write-passthrough';
+    }
+    if (msgCase === 'fetchArgs') {
+      nativeExecKinds.set(execId, 'fetch');
+      onMcpCall({
+        id, execId,
+        toolCallId: `native-fetch-${execId.slice(0, 8)}`,
+        toolName: 'WebFetch',
+        args: { url: msgValue?.url || '', prompt: 'Summarize this content.' },
+      });
+      return 'fetch-passthrough';
+    }
+    if (msgCase === 'grepArgs') {
+      nativeExecKinds.set(execId, 'grep');
+      onMcpCall({
+        id, execId,
+        toolCallId: `native-grep-${execId.slice(0, 8)}`,
+        toolName: 'Grep',
+        args: {
+          pattern: msgValue?.pattern || '',
+          ...(msgValue?.path ? { path: msgValue.path } : {}),
+          ...(msgValue?.glob ? { glob: msgValue.glob } : {}),
+          ...(msgValue?.output_mode ? { output_mode: msgValue.output_mode } : {}),
+        },
+      });
+      return 'grep-passthrough';
+    }
+    // Note: lsArgs / deleteArgs / diagnosticsArgs / shellStreamArgs are NOT
+    // passed through — they have either complex result shapes (Ls) or no
+    // clean claude-code equivalent (Delete, Diagnostics). They keep
+    // falling through to the reject path below.
+  }
+
 
   if (process.env.CURSOR_AGENT_DEBUG) {
     console.log(`[cursor-agent][debug] exec id=${id} execId=${execId} case=${msgCase}`);
@@ -890,6 +954,13 @@ function startConversation(token, options = {}) {
   // Blob store keyed by blobId hex string
   const blobStore = new Map();
 
+  // Map execId → native tool kind for the passthrough-native-tools mode.
+  // Populated by handleExecMessage when it routes a native call through
+  // onMcpCall instead of rejecting; consumed by sendToolResult to build
+  // the correct native result type (ShellResult/ReadResult/etc.) instead
+  // of McpResult. Empty in the default (passthroughNativeTools=false) mode.
+  const _nativeExecKinds = new Map();
+
   // ── Per-stream telemetry (for failure diagnostics) ──
   // We log a one-line `📊 stream-summary` on every stream error so we can
   // grep for patterns: do errors cluster on a specific pool slot? at a
@@ -1081,6 +1152,94 @@ function startConversation(token, options = {}) {
       return out;
     }
 
+    // ── Native passthrough dispatch ──
+    // If this execId was for a native tool call (shellArgs/readArgs/etc.) that
+    // we routed through onMcpCall instead of rejecting, build the matching
+    // native result type rather than McpResult.
+    const nativeKind = _nativeExecKinds.get(execId);
+    if (nativeKind) {
+      _nativeExecKinds.delete(execId);
+      // Extract a single string from the caller's tool_result content.
+      let text;
+      if (typeof content === 'string') text = content;
+      else if (content && Array.isArray(content.items)) {
+        text = content.items.filter((i) => i?.kind === 'text').map((i) => i.text || '').join('\n');
+      } else if (content && typeof content === 'object' && content.error) {
+        text = `[tool_error] ${String(content.error)}`;
+      } else if (content == null) {
+        text = '';
+      } else {
+        text = JSON.stringify(content);
+      }
+
+      if (nativeKind === 'shell') {
+        const result = create(agent.ShellResultSchema, {
+          result: {
+            case: 'success',
+            value: create(agent.ShellSuccessSchema, {
+              command: '', workingDirectory: '',
+              exitCode: 0, signal: '',
+              stdout: text, stderr: '',
+              executionTime: 0,
+            }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'read') {
+        const result = create(agent.ReadResultSchema, {
+          result: {
+            case: 'success',
+            value: create(agent.ReadSuccessSchema, {
+              path: '', content: text,
+              totalLines: text.split('\n').length, fileSize: BigInt(Buffer.byteLength(text)),
+              truncated: false,
+            }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'readResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'write') {
+        const result = create(agent.WriteResultSchema, {
+          result: {
+            case: 'success',
+            value: create(agent.WriteSuccessSchema, {
+              path: '', linesCreated: text.split('\n').length, fileSize: Buffer.byteLength(text),
+              fileContentAfterWrite: '',
+            }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'writeResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'fetch') {
+        const result = create(agent.FetchResultSchema, {
+          result: {
+            case: 'success',
+            value: create(agent.FetchSuccessSchema, {
+              url: '', content: text,
+              statusCode: 200, contentType: 'text/plain',
+            }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'fetchResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'grep') {
+        // GrepResult.success requires a complex GrepUnionResult shape we
+        // don't try to construct. Use the error variant with the text as
+        // the error message — the model treats this as "grep results" text.
+        const result = create(agent.GrepResultSchema, {
+          result: { case: 'error', value: create(agent.GrepErrorSchema, { error: text || '(no matches)' }) },
+        });
+        sendExecClientMessage(id, execId, 'grepResult', result, sendBinaryFrame);
+        return;
+      }
+      // Unknown native kind — fall through to mcpResult (shouldn't happen)
+    }
+
     let mcpResult;
     let summary = 'ok';
     if (content && typeof content === 'object' && content.error) {
@@ -1134,6 +1293,9 @@ function startConversation(token, options = {}) {
         hasEmittedContent = true;
         streamMcpCallCount++;
         currentCallbacks.onMcpCall(info);
+      }, {
+        passthroughNativeTools: !!options.passthroughNativeTools,
+        nativeExecKinds: _nativeExecKinds,
       });
       return;
     }

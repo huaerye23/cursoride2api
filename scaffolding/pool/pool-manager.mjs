@@ -116,6 +116,10 @@ function spawnChannel() {
     ...process.env,
     RATLC_CHANNEL_ID: channelId,
     RATLC_MODEL: POOL_MODEL,
+    // In translate mode, the worker tells startConversation to passthrough
+    // native Cursor tools (Shell/Read/Write/Grep/Fetch) as MCP-shape
+    // tool_use events with Anthropic names (Bash/Read/Write/Grep/WebFetch).
+    RATLC_PASSTHROUGH_NATIVE: POOL_TOOL_MODE === 'translate' ? '1' : '0',
   };
   const proc = fork(WORKER_SCRIPT, [], { env, silent: false });
   const ch = {
