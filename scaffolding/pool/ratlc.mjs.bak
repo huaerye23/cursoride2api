@@ -240,172 +240,124 @@ async function cmdWatch(interval = 2) {
   }
 }
 
-// ── TUI mode (split-screen: dashboard + live api log) ───────────────────
+// ── TUI mode ─────────────────────────────────────────────────────────────
 async function cmdTui() {
   process.stdout.write(ANSI.altScreen + ANSI.hideCursor);
-
-  const apiLines = [];           // raw api log lines (full)
-  const poolLines = [];          // raw pool log lines
+  let recentEvents = [];
   let dirty = true;
-  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status'
 
-  const tailApi = spawn('tail', ['-F', '-n', '50', API_LOG]);
+  // tail the pool log into recentEvents
+  const tail = spawn('tail', ['-F', '-n', '20', POOL_LOG]);
+  tail.stdout.on('data', (chunk) => {
+    for (const line of chunk.toString().split('\n')) {
+      if (!line.trim()) continue;
+      // filter to significant events
+      if (/READY|exited|spawned|contract|mismatch|recycling|tools mismatch|rate limit|warn:|error:|→ tool_use|incoming \/v1/.test(line)) {
+        recentEvents.push(line.slice(0, 160));
+        if (recentEvents.length > 12) recentEvents.shift();
+        dirty = true;
+      }
+    }
+  });
+
+  // tail api log for the few events of interest there too
+  const tailApi = spawn('tail', ['-F', '-n', '5', API_LOG]);
   tailApi.stdout.on('data', (chunk) => {
     for (const line of chunk.toString().split('\n')) {
       if (!line.trim()) continue;
-      apiLines.push(line);
-      if (apiLines.length > 500) apiLines.shift();
-      dirty = true;
-    }
-  });
-  const tailPool = spawn('tail', ['-F', '-n', '30', POOL_LOG]);
-  tailPool.stdout.on('data', (chunk) => {
-    for (const line of chunk.toString().split('\n')) {
-      if (!line.trim()) continue;
-      poolLines.push(line);
-      if (poolLines.length > 500) poolLines.shift();
-      dirty = true;
+      if (/incoming \/v1|→ tool_use|disconnected|error/.test(line)) {
+        recentEvents.push(line.slice(0, 160));
+        if (recentEvents.length > 12) recentEvents.shift();
+        dirty = true;
+      }
     }
   });
 
   function exitTui(code = 0) {
-    tailApi.kill(); tailPool.kill();
+    tail.kill(); tailApi.kill();
     process.stdout.write(ANSI.showCursor + ANSI.restoreScreen);
     process.exit(code);
   }
 
   process.on('SIGINT', () => exitTui(0));
-  if (process.stdin.isTTY) {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
-  } else {
-    console.log(color('(stdin not a TTY — running view-only, no hotkeys)', ANSI.dim));
-  }
+  // raw mode for hotkeys
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
   process.stdin.on('data', async (key) => {
-    if (key === 'q' || key === '\u0003') return exitTui(0);
-    if (key === '1') { viewMode = 'split'; dirty = true; return; }
-    if (key === '2') { viewMode = 'api'; dirty = true; return; }
-    if (key === '3') { viewMode = 'pool'; dirty = true; return; }
-    if (key === '4') { viewMode = 'status'; dirty = true; return; }
-    if (key === 'r') { try { await poolRequest({ type: 'ramp_up', count: 1 }); } catch {} dirty = true; return; }
-    if (key === 'R') { try { await poolRequest({ type: 'ramp_down', count: 1 }); } catch {} dirty = true; return; }
+    if (key === 'q' || key === '') return exitTui(0);
+    if (key === 'r') {
+      try { const r = await poolRequest({ type: 'ramp_up', count: 1 }); recentEvents.push(`[ratlc] ${r.message || 'ramp_up'}`); dirty = true; } catch {}
+    }
+    if (key === 'R') {
+      try { const r = await poolRequest({ type: 'ramp_down', count: 1 }); recentEvents.push(`[ratlc] ${r.message || 'ramp_down'}`); dirty = true; } catch {}
+    }
     if (key === 'k') {
+      // kill first opening/dead channel, or any if none
       try {
         const s = await getStatus();
         const c = s.pool.channels.find((c) => c.state === 'opening' || c.state === 'dead') || s.pool.channels[0];
-        if (c) await poolRequest({ type: 'restart_channel', channelId: c.id });
+        if (c) {
+          const r = await poolRequest({ type: 'restart_channel', channelId: c.id });
+          recentEvents.push(`[ratlc] restart ${c.id}: ${r.message || ''}`); dirty = true;
+        }
       } catch {}
-      dirty = true; return;
     }
   });
-
-  function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ''); }
-  function rpad(s, n) { return s + ' '.repeat(Math.max(0, n - stripAnsi(s).length)); }
-
-  function buildStatusLines(snap) {
-    const out = [];
-    if (!snap?.pool) { out.push(color('pool unreachable', ANSI.red)); return out; }
-    const { pool, config } = snap;
-    const counts = [
-      'ready=' + color(pool.readyCount, ANSI.green),
-      'busy=' + color(pool.busyCount, ANSI.yellow),
-      'opening=' + color(pool.openingCount, ANSI.cyan),
-      'dead=' + color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray),
-    ].join('  ');
-    out.push('Pool ' + color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold) + '  ' + counts + '  pending=' + pool.pendingRequests + '  tool_use_held=' + pool.toolUseIndex);
-    out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
-
-    if (pool.readyCount >= 1) {
-      out.push(color('▶ READY — you can run: ratlc claude', ANSI.green + ANSI.bold));
-    } else if (pool.openingCount > 0) {
-      const opening = (pool.channels || []).filter((c) => c.state === 'opening' || c.state === 'spawning');
-      const maxAttempts = Math.max(0, ...opening.map((c) => c.openAttempts || 0));
-      out.push(color('▶ WARMING UP — wait for ready≥1 before launching claude-code', ANSI.yellow + ANSI.bold) + color('  (best attempt: ' + maxAttempts + ')', ANSI.dim));
-    } else {
-      out.push(color('▶ NOT READY — no channels opening; check status', ANSI.red + ANSI.bold));
-    }
-    out.push('');
-
-    if (pool.channels?.length) {
-      const w = [10, 10, 8, 9, 8, 8, 7, 22];
-      const hdr = ['CHANNEL', 'STATE', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
-      out.push(hdr.map((h, i) => color(rpad(h, w[i]), ANSI.bold)).join(' '));
-      for (const ch of pool.channels) {
-        const c = STATE_COLOR[ch.state] || '';
-        const cols = [
-          rpad(ch.id, w[0]),
-          rpad(c + ch.state + ANSI.reset, w[1]),
-          rpad(String(ch.pid || '-'), w[2]),
-          rpad(String(ch.openAttempts || 0), w[3]),
-          rpad(fmtAgo(ch.openedAt), w[4]),
-          rpad(fmtAgo(ch.lastActivityAt), w[5]),
-          rpad(String(ch.roundsServed || 0), w[6]),
-          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[7]),
-        ];
-        out.push(cols.join(' '));
-      }
-    }
-    return out;
-  }
-
-  function header(ts) {
-    const tabs = (key, label, active) => {
-      const tag = key + ':' + label;
-      return active ? color('[' + tag + ']', ANSI.cyan + ANSI.bold) : color(' ' + tag + ' ', ANSI.dim);
-    };
-    return [
-      color('ratlc tui', ANSI.bold) + '  ' + color(ts, ANSI.dim) +
-      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') +
-      '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[q]', ANSI.cyan) + ' quit',
-      color('─'.repeat(Math.max(1, (process.stdout.columns || 100) - 1)), ANSI.dim),
-    ];
-  }
-
-  function logPaneLines(buf, label, height) {
-    const cols = process.stdout.columns || 200;
-    const out = [color('── ' + label + ' (live tail) ──', ANSI.dim + ANSI.bold)];
-    const lines = buf.slice(-height + 1);
-    for (const l of lines) out.push(color('  ' + l.slice(0, cols - 4), ANSI.dim));
-    while (out.length < height) out.push('');
-    return out;
-  }
 
   async function render() {
     if (!dirty) return;
     dirty = false;
     let snap;
-    try { snap = await getStatus(); } catch (e) { snap = null; }
+    try { snap = await getStatus(); }
+    catch (e) {
+      process.stdout.write(ANSI.clear);
+      console.log(color(`pool unreachable: ${e.message}`, ANSI.red));
+      console.log('Press q to quit.');
+      return;
+    }
     process.stdout.write(ANSI.clear);
-    const cols = process.stdout.columns || 100;
-    const rows = process.stdout.rows || 30;
+    const { pool, config } = snap;
     const ts = new Date().toISOString().slice(11, 19);
-    const hdr = header(ts);
-    for (const line of hdr) console.log(line);
-
-    if (viewMode === 'status') {
-      for (const l of buildStatusLines(snap)) console.log(l);
-      return;
+    console.log(`${color('ratlc tui', ANSI.bold)}  ${color(ts, ANSI.dim)}   ${color('[r]', ANSI.cyan)} ramp+1  ${color('[R]', ANSI.cyan)} ramp-1  ${color('[k]', ANSI.cyan)} restart-stuck  ${color('[q]', ANSI.cyan)} quit`);
+    console.log('─'.repeat(80));
+    const counts = [
+      `ready=${color(pool.readyCount, ANSI.green)}`,
+      `busy=${color(pool.busyCount, ANSI.yellow)}`,
+      `opening=${color(pool.openingCount, ANSI.cyan)}`,
+      `dead=${color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray)}`,
+    ].join('  ');
+    console.log(`Pool ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)}  ${counts}  pending=${pool.pendingRequests}  tool_use_held=${pool.toolUseIndex}`);
+    console.log(`Mode ${color(config.toolMode, ANSI.bold)}  model=${config.model}  parallel-opens=${config.concurrentOpens || 1}`);
+    console.log('');
+    if (pool.channels?.length) {
+      const w = [10, 10, 8, 9, 8, 8, 7, 22];
+      const hdr = ['CHANNEL', 'STATE', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
+      console.log(hdr.map((h, i) => color(h.padEnd(w[i]), ANSI.bold)).join(' '));
+      for (const ch of pool.channels) {
+        const c = STATE_COLOR[ch.state] || '';
+        const row = [
+          ch.id, c + ch.state + ANSI.reset, String(ch.pid || '-'),
+          String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
+          String(ch.roundsServed || 0),
+          ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
+        ];
+        const line = row.map((v, i) => {
+          const raw = String(v).replace(/\x1b\[[0-9;]*m/g, '');
+          return v + ' '.repeat(Math.max(0, w[i] - raw.length));
+        }).join(' ');
+        console.log(line);
+      }
     }
-    if (viewMode === 'api') {
-      for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', rows - hdr.length - 1)) console.log(l);
-      return;
-    }
-    if (viewMode === 'pool') {
-      for (const l of logPaneLines(poolLines, '/tmp/ratlc-pool.log', rows - hdr.length - 1)) console.log(l);
-      return;
-    }
-    // split (default)
-    const statusLines = buildStatusLines(snap);
-    const minStatusHeight = Math.max(statusLines.length, 12);
-    for (let i = 0; i < minStatusHeight; i++) console.log(statusLines[i] ?? '');
-    console.log(color('─'.repeat(Math.max(1, cols - 1)), ANSI.dim));
-    const apiPaneHeight = Math.max(5, rows - hdr.length - minStatusHeight - 2);
-    for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', apiPaneHeight)) console.log(l);
+    console.log('');
+    console.log(color('── recent events ──', ANSI.dim));
+    if (recentEvents.length === 0) console.log(color('  (none yet)', ANSI.dim));
+    for (const e of recentEvents.slice(-10)) console.log(color('  ' + e, ANSI.dim));
   }
 
+  // refresh on a timer, and re-render when events change
   setInterval(() => { dirty = true; }, 1000);
-  setInterval(render, 250);
+  setInterval(render, 200);
   await render();
 }
 
