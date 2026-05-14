@@ -151,9 +151,16 @@ async function handleMessagesRequest(req, res) {
       type: 'message_start',
       message: {
         id: messageId, type: 'message', role: 'assistant',
-        content: [], model: model || 'claude-opus-4-7-thinking-max-fast',
+        content: [], model: model || 'claude-opus-4-7',
         stop_reason: null, stop_sequence: null,
-        usage: { input_tokens: extractTextFromContent(lastMsg.content).length / 4 | 0, output_tokens: 0 },
+        usage: {
+          input_tokens: extractTextFromContent(lastMsg.content).length / 4 | 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          server_tool_use: null,
+          service_tier: 'standard',
+        },
       },
     });
     sseWrite(res, 'ping', { type: 'ping' });
@@ -192,6 +199,10 @@ async function handleMessagesRequest(req, res) {
     });
     sseWrite(res, 'content_block_delta', {
       type: 'content_block_delta', index: blockIdx,
+      delta: { type: 'input_json_delta', partial_json: '' },
+    });
+    sseWrite(res, 'content_block_delta', {
+      type: 'content_block_delta', index: blockIdx,
       delta: { type: 'input_json_delta', partial_json: JSON.stringify(args || {}) },
     });
     sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIdx });
@@ -205,7 +216,13 @@ async function handleMessagesRequest(req, res) {
     sseWrite(res, 'message_delta', {
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { input_tokens: 0, output_tokens: outputTokens },
+      usage: {
+        input_tokens: 0,
+        output_tokens: outputTokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        server_tool_use: null,
+      },
     });
     sseWrite(res, 'message_stop', { type: 'message_stop' });
     try { res.end(); } catch { /* ignore */ }
