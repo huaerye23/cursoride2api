@@ -242,8 +242,10 @@ async function handleMessagesRequest(req, res) {
             // never happened from claude-code's POV.
             return;
           }
+          log(`→ tool_use to client (translated): name=${xlated.name} args=${JSON.stringify(xlated.input).slice(0, 200)}`);
           emitToolUseBlock(msg.anthropic_id, xlated.name, xlated.input);
         } else {
+          log(`→ tool_use to client: name=${msg.name} args=${JSON.stringify(msg.args).slice(0, 200)}`);
           emitToolUseBlock(msg.anthropic_id, msg.name, msg.args);
         }
         stopReason = 'tool_use';
@@ -292,6 +294,54 @@ function handleModels(req, res) {
   }));
 }
 
+function handleMetrics(req, res) {
+  // Prometheus-style text exposition. Pull from pool's status snapshot,
+  // augment with api-server-local counters (TODO).
+  const sock = net.createConnection(POOL_SOCK);
+  let buf = '';
+  const t = setTimeout(() => { try { sock.destroy(); } catch {} ; if (!res.writableEnded) { res.writeHead(503); res.end(''); } }, 5000);
+  sock.on('connect', () => sock.write(JSON.stringify({ type: 'status' }) + '\n'));
+  sock.on('data', (c) => {
+    buf += c.toString('utf8');
+    const idx = buf.indexOf('\n');
+    if (idx === -1) return;
+    try {
+      const m = JSON.parse(buf.slice(0, idx));
+      clearTimeout(t); sock.end();
+      const lines = [];
+      const p = m.pool || {};
+      const cfg = m.config || {};
+      lines.push('# HELP ratlc_pool_channels_total Channels alive in the pool.');
+      lines.push('# TYPE ratlc_pool_channels_total gauge');
+      lines.push(`ratlc_pool_channels_total{model="${cfg.model || ''}",mode="${cfg.toolMode || ''}"} ${p.actualSize || 0}`);
+      lines.push('# HELP ratlc_pool_channels_target Target channel count.');
+      lines.push('# TYPE ratlc_pool_channels_target gauge');
+      lines.push(`ratlc_pool_channels_target ${p.configuredSize || 0}`);
+      lines.push('# HELP ratlc_pool_channels_by_state Channels by state.');
+      lines.push('# TYPE ratlc_pool_channels_by_state gauge');
+      lines.push(`ratlc_pool_channels_by_state{state="ready"} ${p.readyCount || 0}`);
+      lines.push(`ratlc_pool_channels_by_state{state="busy"} ${p.busyCount || 0}`);
+      lines.push(`ratlc_pool_channels_by_state{state="opening"} ${p.openingCount || 0}`);
+      lines.push(`ratlc_pool_channels_by_state{state="dead"} ${p.deadCount || 0}`);
+      lines.push('# HELP ratlc_pool_pending_requests Requests queued awaiting a ready channel.');
+      lines.push('# TYPE ratlc_pool_pending_requests gauge');
+      lines.push(`ratlc_pool_pending_requests ${p.pendingRequests || 0}`);
+      lines.push('# HELP ratlc_pool_tool_use_held Tool_use round-trips currently held awaiting tool_result.');
+      lines.push('# TYPE ratlc_pool_tool_use_held gauge');
+      lines.push(`ratlc_pool_tool_use_held ${p.toolUseIndex || 0}`);
+      lines.push('# HELP ratlc_channel_rounds Successful rounds served per channel.');
+      lines.push('# TYPE ratlc_channel_rounds counter');
+      for (const ch of (p.channels || [])) {
+        lines.push(`ratlc_channel_rounds{channel="${ch.id}"} ${ch.roundsServed || 0}`);
+        lines.push(`ratlc_channel_open_attempts{channel="${ch.id}"} ${ch.openAttempts || 0}`);
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+      res.end(lines.join('\n') + '\n');
+    } catch { /* keep accumulating */ }
+  });
+  sock.on('error', (e) => { clearTimeout(t); if (!res.writableEnded) { res.writeHead(503); res.end(`pool socket error: ${e.message}`); } });
+}
+
 function handleHealth(req, res) {
   // Open a one-shot socket to the pool — keeps administrative requests
   // off the main streaming socket.
@@ -333,6 +383,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && path === '/v1/messages') return handleMessagesRequest(req, res);
   if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return handleModels(req, res);
   if (req.method === 'GET' && path === '/health') return handleHealth(req, res);
+  if (req.method === 'GET' && path === '/metrics') return handleMetrics(req, res);
   if (req.method === 'HEAD') { res.writeHead(200); return res.end(); }
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));

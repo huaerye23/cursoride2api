@@ -22,6 +22,11 @@ const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);  // 20
 const PING_TIMEOUT_MS = parseInt(process.env.PING_TIMEOUT_MS || '45000', 10);
 const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10); // wait between worker spawns
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
+// How many channels are allowed to run the retry lottery concurrently.
+// Default 1 (sequential, safe against rate-limit). Set higher to bring the
+// pool up faster at risk of tripping ERROR_PRO_USER_RATE_LIMIT_EXCEEDED.
+// 2 is usually fine on a fresh quota; 3+ regularly trips.
+const POOL_CONCURRENT_OPENS = Math.max(1, parseInt(process.env.POOL_CONCURRENT_OPENS || '1', 10));
 const WORKER_SCRIPT = path.join(__dirname, 'bridge-worker.mjs');
 
 if (!['contract', 'translate'].includes(POOL_TOOL_MODE)) {
@@ -243,21 +248,20 @@ function handleWorkerExit(ch, code, signal) {
   setTimeout(maybeSpawnNext, 500);
 }
 
-// Sequential-open guard: only one channel runs the retry lottery at a time.
-function anyChannelOpening() {
+// Concurrent-open guard: at most POOL_CONCURRENT_OPENS channels in
+// spawning/opening state at once. Default 1 (rate-limit safe).
+function countOpening() {
+  let n = 0;
   for (const ch of channels.values()) {
-    if (ch.state === 'spawning' || ch.state === 'opening') return true;
+    if (ch.state === 'spawning' || ch.state === 'opening') n++;
   }
-  return false;
+  return n;
 }
 
 function maybeSpawnNext() {
-  if (channels.size >= currentTargetSize) return;
-  if (anyChannelOpening()) {
-    log(`maybeSpawnNext: another channel already opening; deferring`);
-    return;
+  while (channels.size < currentTargetSize && countOpening() < POOL_CONCURRENT_OPENS) {
+    spawnChannel();
   }
-  spawnChannel();
 }
 
 // Target pool size, mutable via ramp_up / ramp_down
@@ -562,6 +566,7 @@ function statusSnapshot() {
     config: {
       model: POOL_MODEL,
       toolMode: POOL_TOOL_MODE,
+      concurrentOpens: POOL_CONCURRENT_OPENS,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
       poolToolsContractCount: poolTools ? poolTools.length : null,
@@ -601,9 +606,9 @@ server.listen(POOL_SOCK, () => {
   log(`listening on ${POOL_SOCK}, target size=${currentTargetSize}, model=${POOL_MODEL}`);
 });
 
-// ── Spawn initial pool, SEQUENTIALLY (one at a time) ─────────────────────
-log(`bringing up initial pool target=${currentTargetSize}, sequential (one opening at a time)`);
-spawnChannel();  // first one only — the rest follow when this one is ready
+// ── Spawn initial pool, honoring POOL_CONCURRENT_OPENS ───────────────────
+log(`bringing up initial pool target=${currentTargetSize}, up to ${POOL_CONCURRENT_OPENS} concurrent opens`);
+maybeSpawnNext();
 
 // ── Shutdown ─────────────────────────────────────────────────────────────
 function shutdown(signal) {
