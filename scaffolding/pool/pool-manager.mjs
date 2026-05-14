@@ -128,6 +128,7 @@ function spawnChannel() {
     ...(POOL_TOOL_MODE === 'translate' ? {
       CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT: '1800000',
       CURSOR_STALL_TIMEOUT_MS: '600000',
+      CURSOR_LOG_NATIVE_EXEC: '1',
     } : {}),
   };
   const proc = fork(WORKER_SCRIPT, [], { env, silent: false });

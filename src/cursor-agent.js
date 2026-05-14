@@ -525,6 +525,12 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
   const passthroughNative = opts && opts.passthroughNativeTools === true;
   const nativeExecKinds = opts && opts.nativeExecKinds; // Map<execId, 'shell'|'read'|...>
 
+  // Debug: log every exec case + whether passthrough is enabled. Lets us see
+  // which path Cursor is using for native tools.
+  if (process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+    console.log(`[cursor-agent] exec case=${msgCase} passthrough=${passthroughNative}`);
+  }
+
   // ── passthrough native tools ────────────────────────────────────────────
   // When passthroughNativeTools is enabled, instead of rejecting native tool
   // calls (shellArgs / readArgs / writeArgs / fetchArgs), translate them to
@@ -539,6 +545,28 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       nativeExecKinds.set(execId, 'shell');
       onMcpCall({ id, execId, toolCallId: `native-shell-${execId.slice(0, 8)}`, toolName: 'Bash', args });
       return 'shell-passthrough';
+    }
+    if (msgCase === 'shellStreamArgs') {
+      // Streaming shell — same idea as shellArgs but the result is a
+      // ShellStream (multi-event), not a ShellResult. Routes to Bash too;
+      // sendToolResult builds stdout + exit events.
+      const args = {
+        command: msgValue?.command || '',
+        ...(msgValue?.working_directory ? { description: `(cwd: ${msgValue.working_directory})` } : {}),
+      };
+      nativeExecKinds.set(execId, 'shellStream');
+      onMcpCall({ id, execId, toolCallId: `native-shellstream-${execId.slice(0, 8)}`, toolName: 'Bash', args });
+      return 'shellStream-passthrough';
+    }
+    if (msgCase === 'backgroundShellSpawnArgs') {
+      const args = {
+        command: msgValue?.command || '',
+        run_in_background: true,
+        ...(msgValue?.working_directory ? { description: `(cwd: ${msgValue.working_directory})` } : {}),
+      };
+      nativeExecKinds.set(execId, 'backgroundShell');
+      onMcpCall({ id, execId, toolCallId: `native-bgshell-${execId.slice(0, 8)}`, toolName: 'Bash', args });
+      return 'backgroundShell-passthrough';
     }
     if (msgCase === 'readArgs') {
       nativeExecKinds.set(execId, 'read');
@@ -1196,6 +1224,39 @@ function startConversation(token, options = {}) {
           },
         });
         sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'shellStream') {
+        // shellStream is a multi-event stream. Send stdout chunk + exit.
+        const stdoutEvt = create(agent.ShellStreamSchema, {
+          event: {
+            case: 'stdout',
+            value: create(agent.ShellStreamStdoutSchema, { data: text }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'shellStream', stdoutEvt, sendBinaryFrame);
+        const exitEvt = create(agent.ShellStreamSchema, {
+          event: {
+            case: 'exit',
+            value: create(agent.ShellStreamExitSchema, { code: 0, cwd: '', aborted: false }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'shellStream', exitEvt, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'backgroundShell') {
+        // Background spawn returns a one-shot "started ok" with a shell_id.
+        // We don't actually track a real shell_id; synthesize one.
+        const sid = (Math.random().toString(36).slice(2, 10));
+        const result = create(agent.BackgroundShellSpawnResultSchema, {
+          result: {
+            case: 'success',
+            value: create(agent.BackgroundShellSpawnSuccessSchema, {
+              shellId: sid, command: '', workingDirectory: '', pid: 0,
+            }),
+          },
+        });
+        sendExecClientMessage(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'read') {
