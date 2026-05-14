@@ -163,12 +163,7 @@ function openOnce(initialPrompt, allTools) {
       onError: (err) => {
         const msg = String(err?.message || err || '');
         if (/unpaid invoice|cursor\.com\/dashboard/i.test(msg)) resolve({ kind: 'unpaid', msg });
-        // Hard cap (account quota exhausted): keep exponential backoff so
-        // we give Cursor's quota meaningful room to recover.
         else if (/RATE_LIMIT_EXCEEDED|too many requests/i.test(msg)) resolve({ kind: 'rate_limit_hard', msg });
-        // Soft per-stream throttle ("Please wait a bit before trying again")
-        // — H1 doc says this is recoverable on next retry. Treat as a short
-        // fixed backoff instead of joining the exponential ladder.
         else if (/rate limit/i.test(msg)) resolve({ kind: 'rate_limit_soft', msg });
         else resolve({ kind: 'other_error', msg });
       },
@@ -189,19 +184,12 @@ async function openWithRetry(system, callerTools) {
   const primingPrompt = buildPrimingPrompt(system, cTools);
 
   setState('opening');
-  // Backoff state for HARD RATE_LIMIT_EXCEEDED only. Soft "Please wait" uses
-  // a short fixed wait (it's recoverable on next retry, per H1_RESULTS.md).
-  // We reset the hard backoff to its floor on any non-rate-limit-hard
-  // outcome so a transient burst can't permanently park a channel in the
-  // 60 s zone.
-  const HARD_BACKOFF_FLOOR_MS = 5000;
-  const HARD_BACKOFF_CEILING_MS = 60000;
-  // 3s default is a compromise: aggressive enough to recover quickly when
-  // the soft throttle clears, slow enough not to burst-trigger the hard
-  // RATE_LIMIT_EXCEEDED cap (1s caused ~23% of attempts to flip from soft
-  // to hard in observed runs). Tune via RATLC_SOFT_BACKOFF_MS.
-  const SOFT_BACKOFF_MS = parseInt(process.env.RATLC_SOFT_BACKOFF_MS || '3000', 10);
-  let hardBackoff = HARD_BACKOFF_FLOOR_MS;
+  // Empirically (confirmed on Mac), every Cursor refusal during open —
+  // unpaid_invoice, soft "Please wait" rate-limit, hard RATE_LIMIT_EXCEEDED,
+  // no_yield — is short-lived. Backing off makes things worse, not better:
+  // the channel sits idle while the gate has long since cleared. So we just
+  // retry every OPEN_RETRY_MS (default 300 ms) regardless of error kind,
+  // with a ±25% jitter so 5 concurrent channels don't burst-synchronize.
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
     // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
@@ -219,33 +207,13 @@ async function openWithRetry(system, callerTools) {
       setState('ready');
       return;
     }
-    if (result.kind === 'unpaid') {
-      hardBackoff = HARD_BACKOFF_FLOOR_MS;  // reset — this attempt cleared the throttle
-      await sleep(jitter(OPEN_RETRY_MS));
-      continue;
+    if (result.kind === 'other_error') {
+      setState('dead', { error: result.msg || result.kind });
+      process.exit(1);
     }
-    if (result.kind === 'rate_limit_soft') {
-      // Soft per-stream throttle. Don't escalate; don't touch hardBackoff.
-      // Jitter de-correlates 5 concurrent channels so they don't all wake
-      // at the same instant and burst-trigger the hard cap.
-      await sleep(jitter(SOFT_BACKOFF_MS));
-      continue;
-    }
-    if (result.kind === 'rate_limit_hard') {
-      const sleepMs = jitter(hardBackoff);
-      send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt}, backoff ${sleepMs}ms` });
-      await sleep(sleepMs);
-      hardBackoff = Math.min(Math.floor(hardBackoff * 1.5), HARD_BACKOFF_CEILING_MS);
-      continue;
-    }
-    if (result.kind === 'no_yield') {
-      hardBackoff = HARD_BACKOFF_FLOOR_MS;  // reset — got a real response
-      await sleep(jitter(OPEN_RETRY_MS));
-      continue;
-    }
-    // Hard error — die.
-    setState('dead', { error: result.msg || result.kind });
-    process.exit(1);
+    // unpaid / rate_limit_soft / rate_limit_hard / no_yield → just retry.
+    await sleep(jitter(OPEN_RETRY_MS));
+    continue;
   }
   setState('dead', { error: 'open exhausted' });
   process.exit(1);
