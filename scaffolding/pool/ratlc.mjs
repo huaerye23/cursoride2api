@@ -430,7 +430,13 @@ async function cmdTui() {
       'dead=' + color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray),
     ].join('  ');
     out.push('Pool ' + color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold) + '  ' + counts + '  pending=' + pool.pendingRequests + '  tool_use_held=' + pool.toolUseIndex);
-    out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
+    const groups = Array.isArray(pool.groups) ? pool.groups : [];
+    const multiGroup = groups.length > 1;
+    if (multiGroup) {
+      out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  groups=' + color(String(groups.length), ANSI.bold) + ' (default=' + (config.model || groups.find((g) => g.isDefault)?.model || '?') + ')  parallel-opens=' + (config.concurrentOpens || 1));
+    } else {
+      out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
+    }
     if (pool.readyCount >= 1) {
       out.push(color('▶ READY — you can run: ratlc claude', ANSI.green + ANSI.bold));
     } else if (pool.openingCount > 0) {
@@ -440,14 +446,38 @@ async function cmdTui() {
     } else {
       out.push(color('▶ NOT READY — no channels opening; check status', ANSI.red + ANSI.bold));
     }
+
+    // Per-group summary table (only shown when there's more than one group;
+    // single-group setups stay visually unchanged).
+    if (multiGroup) {
+      out.push('');
+      const gw = [42, 7, 7, 6, 6, 6, 7];
+      const ghdr = ['GROUP', 'TARGET', 'READY', 'BUSY', 'OPEN', 'DEAD', 'ROUNDS'];
+      out.push('  ' + ghdr.map((h, i) => color(rpad(h, gw[i]), ANSI.bold)).join(' '));
+      for (const g of groups) {
+        const label = g.model + (g.isDefault ? color(' (default)', ANSI.dim) : '') + (g.draining ? color(' (draining)', ANSI.yellow) : '');
+        out.push('  ' + [
+          rpad(label, gw[0]),
+          rpad(String(g.target || 0), gw[1]),
+          rpad(color(String(g.ready || 0), ANSI.green), gw[2]),
+          rpad(color(String(g.busy || 0), ANSI.yellow), gw[3]),
+          rpad(color(String(g.opening || 0), ANSI.cyan), gw[4]),
+          rpad(color(String(g.dead || 0), g.dead ? ANSI.red : ANSI.gray), gw[5]),
+          rpad(String(g.rounds || 0), gw[6]),
+        ].join(' '));
+      }
+    }
+
     out.push('');
     if (pool.channels?.length) {
+      // Channel table — sectioned by group when there's more than one group,
+      // flat (today's behavior) when only one.
       const w = [10, 10, 8, 9, 8, 8, 7, 22];
       const hdr = ['CHANNEL', 'STATE', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
-      out.push(hdr.map((h, i) => color(rpad(h, w[i]), ANSI.bold)).join(' '));
-      for (const ch of pool.channels) {
+
+      function emitRow(ch) {
         const c = STATE_COLOR[ch.state] || '';
-        const cols = [
+        return [
           rpad(ch.id, w[0]),
           rpad(c + ch.state + ANSI.reset, w[1]),
           rpad(String(ch.pid || '-'), w[2]),
@@ -456,8 +486,41 @@ async function cmdTui() {
           rpad(fmtAgo(ch.lastActivityAt), w[5]),
           rpad(String(ch.roundsServed || 0), w[6]),
           rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[7]),
-        ];
-        out.push(cols.join(' '));
+        ].join(' ');
+      }
+
+      if (multiGroup) {
+        // Bucket channels by group; preserve group order from the groups array
+        // (default first, then alts). Channels with an unknown group ID land
+        // in a synthetic "(orphan)" bucket — shouldn't happen in normal
+        // operation but visible if it does.
+        const buckets = new Map();
+        for (const g of groups) buckets.set(g.model, []);
+        const orphans = [];
+        for (const ch of pool.channels) {
+          if (ch.group && buckets.has(ch.group)) buckets.get(ch.group).push(ch);
+          else orphans.push(ch);
+        }
+        let first = true;
+        for (const g of groups) {
+          const rows = buckets.get(g.model) || [];
+          if (rows.length === 0) continue;
+          if (!first) out.push('');
+          first = false;
+          const tag = g.model + (g.isDefault ? color(' (default)', ANSI.dim) : '') + (g.draining ? color(' (draining)', ANSI.yellow) : '');
+          out.push(color('── ' + tag + ' ──', ANSI.dim));
+          out.push(hdr.map((h, i) => color(rpad(h, w[i]), ANSI.bold)).join(' '));
+          for (const ch of rows) out.push(emitRow(ch));
+        }
+        if (orphans.length) {
+          out.push('');
+          out.push(color('── (no group / unknown) ──', ANSI.red));
+          out.push(hdr.map((h, i) => color(rpad(h, w[i]), ANSI.bold)).join(' '));
+          for (const ch of orphans) out.push(emitRow(ch));
+        }
+      } else {
+        out.push(hdr.map((h, i) => color(rpad(h, w[i]), ANSI.bold)).join(' '));
+        for (const ch of pool.channels) out.push(emitRow(ch));
       }
     }
     return out;
