@@ -1437,6 +1437,92 @@ The RATLC pool's `api-server.mjs` is a clean parallel implementation; it shares 
 
 If you switch between the two, only one server should listen on `:4242` at a time.
 
+### Multi-group model pools (commits ending the `feat/ratlc-mvp` v1 set)
+
+The default pool topology is "one model, N channels." Real claude-code
+workflows want more than one model alive at once — Opus for hard
+reasoning, Sonnet/Haiku for cheap throughput, Codex for code edits —
+without paying the bring-up gate twice on two separate `ratlc up`
+invocations. The multi-group changes promote `groups: Map<modelId,
+{targetSize, channels, draining}>` to the pool-manager's primary data
+structure, with the legacy single-group setup becoming "one group
+sized by `POOL_MODEL`/`POOL_SIZE`."
+
+Routing on every POST `/v1/messages`:
+
+1. api-server extracts `req.body.model`, forwards it on the socket op.
+2. Pool-manager: known group → LRU pick from that group's channels.
+3. Known group, no ready channels → wait `POOL_GROUP_WAIT_MS`
+   (default 5000ms) for one to surface, then fall back to default.
+4. Unknown / missing model → fall back to default immediately.
+5. The first event back is `route_decision` carrying `servedModel`,
+   `channelId`, `fallback`, `fallbackReason`. api-server stamps these
+   on the response as `x-ratlc-routed-to`, `x-ratlc-channel`,
+   `x-ratlc-fallback`, `x-ratlc-fallback-reason` BEFORE the SSE
+   preamble, so clients see truthful provenance without parsing logs.
+
+Lifecycle of a group:
+
+- `POOL_GROUPS="modelA:N,modelB:M"` at boot declares extra groups;
+  `POOL_MODEL`/`POOL_SIZE` always defines the default group.
+- `ratlc add-group <model> <N>` registers a group at runtime (or
+  resizes if it already exists). Refused while a previous removal is
+  draining.
+- `ratlc remove-group <model>` flips the group's `draining` flag:
+  refuses new dispatches (they fall back to default with
+  `fallbackReason=group-draining`), lets in-flight finish, kills
+  channels as they go idle. The group entry is removed once channel
+  count hits 0. Default group cannot be removed.
+- `ratlc ramp ±N --group=<model>` rampe a specific group's target.
+
+What didn't change:
+
+- `bridge-worker.mjs` — the model is a per-worker fork-time env var
+  (`RATLC_MODEL`); workers don't know about groups.
+- `src/cursor-agent*.js` — transport per channel, group-agnostic.
+- `convKey` — already hashes `(modelId, sessionId)` so per-group
+  thinking buffers segregate naturally (see commit `c58b19e`).
+- `POOL_CONCURRENT_OPENS` — global rate-limit budget, shared across
+  groups. The opener interleaves spawns across groups that still need
+  channels.
+- Channel ids — globally monotonic. `ratlc restart ch-N` still works.
+- `token.json` — all groups share the same Cursor account / quota.
+  Per-group token partitioning is v2.
+
+Tests added:
+
+- `scaffolding/pool/multi-group-routing-test.mjs` — 8-step routing
+  test driven through the socket protocol via a synthetic
+  `mock-worker.mjs` (forked when `POOL_TEST_MOCK_CHANNELS=1`).
+  Covers default-group-only-at-boot, add_group spawning,
+  exact-match routing, unknown-model fallback (reason
+  `unknown-model`), zero-ready fallback after `POOL_GROUP_WAIT_MS`
+  (reason `group-no-ready`), default-group remove refusal,
+  draining-group fallback, status-snapshot shape.
+- `scaffolding/pool/add-remove-group-test.mjs` — 9-step mutation
+  lifecycle test on the same harness: `POOL_GROUPS` boot, runtime
+  add, ramp_up/ramp_down per group, idempotent resize, default-group
+  remove refusal, unknown-group ramp refusal, drain → eviction, add
+  while draining refusal.
+- Mock channels never touch cursor-agent; tests run in <2s and burn
+  zero quota.
+
+Live regressions verified post-change: `tool-roundtrip` (14.3s),
+`multi-turn --mode=full` (16.1s), `parallel-tools` (17.3s),
+`reinject-thinking` (8.7s), `thinking-buffer-test` (unit). All PASS
+without modification — single-group setups are bit-identical with the
+pre-multi-group code path.
+
+`/health` now returns `pool.groups[]` and `pool.defaultGroup`;
+`/metrics` adds `ratlc_group_channels{group="...",state="..."}` plus
+`group=` labels on existing per-channel counters. The TUI's `4:status`
+view gains a `GROUP` column on the channel table and a per-group
+summary block above it; the `:`-bar accepts `:add-group`,
+`:remove-group`, `:groups`, `:ramp ±N` (default group).
+
+See `scaffolding/pool/MULTI_GROUP_PLAN.md` § 13 for the decision log
+of the 5 design questions resolved along the way.
+
 ---
 
 ## Future work / open issues

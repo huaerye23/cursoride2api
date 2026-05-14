@@ -55,7 +55,9 @@ the children + api-server).
 | `POOL_CONTEXT_MODE` | `full` \| `last` | `last` | How multi-turn conversations are forwarded. **`full` strongly recommended for claude-code.** See [§ Context modes](#context-modes-fullvslast) below. |
 | `POOL_CONCURRENT_OPENS` | `1`–`5` | `1` | How many channels open in parallel. `1` is safe but slow; `5` is faster but more rate-limit pressure. **At `>=5`, H2 trips the per-account rate limit**; H1 is fine. |
 | `POOL_SIZE` | integer | `1` (cli `up N` overrides) | Target channel count. `./scaffolding/pool/ratlc up N` is the easy way. |
-| `POOL_MODEL` | model id | `claude-opus-4-7-thinking-max-fast` | Which Cursor model to drive. |
+| `POOL_MODEL` | model id | `claude-opus-4-7-thinking-max-fast` | Which Cursor model to drive (the **default group**). |
+| `POOL_GROUPS` | `modelA:N,modelB:M,...` | unset | Extra **named groups** at boot. Each `model:N` declares a group of N channels pinned to that Cursor model. Channels are partitioned across groups; per-request `body.model` picks which group serves. Groups can also be added/removed at runtime via `ratlc add-group`/`remove-group`. |
+| `POOL_GROUP_WAIT_MS` | milliseconds | `5000` | When a request names a known group whose channels are all opening/busy, wait this long for one to surface before falling back to the default group. Set to `0` for immediate fallback. |
 | `POOL_REINJECT_THINKING` | `0` \| `1` | `0` | Captures the model's `thinking_delta` per `convKey`; on the next turn for the same conversation, prepends `<thinking>…</thinking>` text into the outbound prompt. Pool-side symmetry with `server.js`'s `CURSOR_REINJECT_THINKING`. See [§ Thinking continuity](#thinking-continuity) below. |
 | `POOL_REINJECT_THINKING_MAX_BYTES_PER_TURN` | int | `4096` | Cap on captured bytes per assistant turn (truncates further deltas in the same turn). Matches server.js's default. |
 | `POOL_REINJECT_THINKING_MAX_TURNS` | int | `5` | Number of past assistant turns kept per `convKey`; FIFO-evicts older. |
@@ -65,6 +67,102 @@ the children + api-server).
 | `CURSOR_LOG_NATIVE_EXEC` | `1` | unset | Log every native exec passthrough event |
 | `LOG_REQUEST_TOOLS` | `1` | unset | api-server logs incoming tool list per request |
 | `LOG_REQUEST_BODY` | n/a | n/a | Body summary (last-message role + content shape) is always on. |
+
+## Multi-group model pools
+
+A single pool can host multiple **named groups**, each pinned to a
+different Cursor model. The `body.model` field of `/v1/messages`
+routes the request to the matching group; unknown / missing models
+fall back to the default group. Useful when you want one stack to
+serve several models at once (Opus for hard work, Sonnet for cheap
+throughput, etc.) without running multiple `ratlc up` invocations on
+multiple ports.
+
+### Bring up multiple groups at boot
+
+```bash
+POOL_MODEL=claude-opus-4-7-thinking-max-fast POOL_SIZE=10 \
+POOL_GROUPS="claude-4.6-sonnet-medium-fast:3" \
+POOL_BRIDGE_PROTOCOL=h1 POOL_TOOL_MODE=translate POOL_CONTEXT_MODE=full \
+POOL_CONCURRENT_OPENS=5 \
+  ./scaffolding/pool/ratlc up
+```
+
+This brings up 13 channels total: 10 on the default Opus group + 3 on
+the Sonnet group. `POOL_CONCURRENT_OPENS` is a **global** open budget
+shared across all groups, so opens are interleaved at the
+rate-limit-safe pace, not per-group.
+
+### Mutate groups at runtime
+
+```bash
+ratlc groups                                    # per-group status table
+ratlc add-group claude-4.6-sonnet-medium-fast 3 # register + spawn
+ratlc remove-group claude-4.6-sonnet-medium-fast # drain + evict
+ratlc ramp +2 --group=claude-4.6-sonnet-medium-fast  # grow named group
+ratlc ramp -1 --group=claude-4.6-sonnet-medium-fast  # shrink named group
+```
+
+`remove-group` is **drain semantics**: in-flight requests finish
+normally, new requests to that group fall back to default with
+`x-ratlc-fallback-reason: group-draining`, and channels are killed as
+they go idle. The default group cannot be removed.
+
+### Route per-request via `body.model`
+
+```bash
+curl -s http://127.0.0.1:4242/v1/messages -i \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-4.6-sonnet-medium-fast","max_tokens":256,
+       "messages":[{"role":"user","content":"hi"}]}'
+
+HTTP/1.1 200 OK
+x-ratlc-routed-to: claude-4.6-sonnet-medium-fast   # the actual serving group
+x-ratlc-channel: ch-7                              # which channel ran it
+x-ratlc-fallback: 0
+```
+
+Unknown models silently fall back to default (200 OK with the headers
+flipped):
+
+```
+x-ratlc-routed-to: claude-opus-4-7-thinking-max-fast
+x-ratlc-channel: ch-2
+x-ratlc-fallback: 1
+x-ratlc-fallback-reason: unknown-model
+```
+
+Other fallback reasons:
+- `group-draining` — the target group is being removed
+- `group-no-ready` — the target group has zero ready channels even
+  after waiting `POOL_GROUP_WAIT_MS` (default 5s) for one to surface
+
+### claude-code with a specific group
+
+```bash
+ratlc claude --model claude-4.6-sonnet-medium-fast
+# ANTHROPIC_MODEL=claude-4.6-sonnet-medium-fast forwarded; refuses if
+# no matching group exists. Run `ratlc add-group MODEL N` first.
+```
+
+### Per-group observability
+
+- `ratlc status` adds a `GROUP` column on the per-channel table and a
+  per-group summary above the table.
+- `/health` returns `pool.groups[]` (per-group ready/busy/opening/dead
+  counts + targets).
+- `/metrics` emits `ratlc_group_channels{group="...",state="..."}`
+  series plus a per-channel `group=` label on existing counters.
+
+### Constraints
+
+- The default group is always `POOL_MODEL` and cannot be removed.
+- All groups share `token.json` (same Cursor account, same quota).
+  Per-group token partitioning is out of scope for v1.
+- Channel ids stay globally monotonic (`ch-0`, `ch-1`, ...) regardless
+  of group ownership. `ratlc restart ch-N` works the same.
+- `POOL_TOOL_MODE` / `POOL_CONTEXT_MODE` / `POOL_REINJECT_THINKING`
+  apply pool-wide (no per-group overrides in v1).
 
 ## Context modes (`full` vs `last`)
 
@@ -196,6 +294,11 @@ All three should PASS in the recommended config (`h1 + translate + full`).
   captured per `convKey` (using `x-claude-code-session-id` for ironclad
   attribution), reinjected as `<thinking>…</thinking>` text on
   subsequent turns. Mirrors `server.js`'s `CURSOR_REINJECT_THINKING`.
+- ✅ **Multi-group model pools** — one pool, multiple groups, one
+  group per model. Per-request routing via `body.model`. Runtime
+  `add-group`/`remove-group`/`ramp --group`. `x-ratlc-*` response
+  headers expose routing decisions + fallback reasons. See
+  [§ Multi-group model pools](#multi-group-model-pools).
 
 See `H1_RESULTS.md` for the scale-test results (10 channels @ H1: 0
 hard rate-limit hits vs 108 on H2). See `TOOL_USE_HANG_FINDINGS.md`
