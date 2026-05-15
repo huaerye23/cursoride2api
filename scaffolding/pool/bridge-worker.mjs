@@ -35,9 +35,34 @@ const MODEL = process.env.RATLC_MODEL || 'claude-opus-4-7-thinking-max-fast';
 // `last` mode (default) it's told each yield is the next user message
 // verbatim — the historical behavior.
 const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
-console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL} ctxMode=${POOL_CONTEXT_MODE}`);
 const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '500', 10);
 const OPEN_RETRY_MS = parseInt(process.env.RATLC_OPEN_RETRY_MS || '300', 10);
+
+// Retry mode selects how the channel paces its open attempts.
+//   constant (default) — fire every CONSTANT_INTERVAL_MS regardless of
+//     response kind. Maximum throughput per channel; the right choice
+//     when the gate is mostly probabilistic and the soft-rate-limit
+//     responses themselves are cheap.
+//   aimd — TCP-style adaptive: multiplicative back-off on rate-limit,
+//     additive ramp on success. Self-tunes to the highest rate Cursor
+//     tolerates without triggering soft limits. Right choice when
+//     sustained heavy retry would visibly degrade Cursor's response
+//     latency.
+const RETRY_MODE = (process.env.RATLC_RETRY_MODE || 'constant').toLowerCase();
+if (!['constant', 'aimd'].includes(RETRY_MODE)) {
+  console.error(`[bridge-worker] invalid RATLC_RETRY_MODE=${RETRY_MODE} (must be constant|aimd)`);
+  process.exit(1);
+}
+const CONSTANT_INTERVAL_MS = parseInt(process.env.RATLC_CONSTANT_INTERVAL_MS || '500', 10);
+const WAIT_FLOOR_MS = parseInt(process.env.RATLC_WAIT_FLOOR_MS || '300', 10);
+const WAIT_CEILING_MS = parseInt(process.env.RATLC_WAIT_CEILING_MS || '30000', 10);
+const WAIT_DECREASE_MS = parseInt(process.env.RATLC_WAIT_DECREASE_MS || '50', 10);
+const WAIT_INCREASE_FACTOR = parseFloat(process.env.RATLC_WAIT_INCREASE_FACTOR || '2.0');
+const INITIAL_WAIT_MS = parseInt(process.env.RATLC_INITIAL_WAIT_MS || '1000', 10);
+const _retryParamSummary = RETRY_MODE === 'constant'
+  ? `interval=${CONSTANT_INTERVAL_MS}ms`
+  : `floor=${WAIT_FLOOR_MS}ms ceiling=${WAIT_CEILING_MS}ms init=${INITIAL_WAIT_MS}ms decr=${WAIT_DECREASE_MS}ms incrx=${WAIT_INCREASE_FACTOR}`;
+console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL} ctxMode=${POOL_CONTEXT_MODE} retry=${RETRY_MODE}(${_retryParamSummary})`);
 // When true, native Cursor tool calls (shellArgs/readArgs/writeArgs/...)
 // are translated to MCP-shape tool_use events under the matching
 // Anthropic name (Bash/Read/Write/...) instead of being rejected.
@@ -184,25 +209,11 @@ async function openWithRetry(system, callerTools) {
   const primingPrompt = buildPrimingPrompt(system, cTools);
 
   setState('opening');
-  // AIMD self-tuning wait time. Goal: keep firing at the highest rate
-  // Cursor tolerates without triggering soft rate-limits.
-  //   - Any rate-limit response (soft "Please wait" or hard
-  //     RATE_LIMIT_EXCEEDED) means we were too fast → MULTIPLICATIVE
-  //     INCREASE of wait (x2): sharp back-off.
-  //   - Any other response (unpaid_invoice probabilistic gate, no_yield,
-  //     and would-be 'opened' which exits the loop) means Cursor accepted
-  //     our request → ADDITIVE DECREASE of wait (-50ms): slowly probe a
-  //     faster rate.
-  // The channel converges to a wait that's just below the soft-limit
-  // threshold. Floor 300ms (most aggressive we'll try); ceiling 30s
-  // (slowest we'll go). The reset/escalate dance is no longer needed —
-  // AIMD does both jobs continuously.
-  const WAIT_FLOOR_MS = parseInt(process.env.RATLC_WAIT_FLOOR_MS || '300', 10);
-  const WAIT_CEILING_MS = parseInt(process.env.RATLC_WAIT_CEILING_MS || '30000', 10);
-  const WAIT_DECREASE_MS = parseInt(process.env.RATLC_WAIT_DECREASE_MS || '50', 10);
-  const WAIT_INCREASE_FACTOR = parseFloat(process.env.RATLC_WAIT_INCREASE_FACTOR || '2.0');
-  const INITIAL_WAIT_MS = parseInt(process.env.RATLC_INITIAL_WAIT_MS || '1000', 10);
-  let currentWait = INITIAL_WAIT_MS;
+  // Per-channel wait between attempts. constant mode pins it to
+  // CONSTANT_INTERVAL_MS for the whole loop; aimd mode adjusts it on
+  // every response (multiplicative back-off on rate-limit, additive ramp
+  // toward floor otherwise).
+  let currentWait = RETRY_MODE === 'aimd' ? INITIAL_WAIT_MS : CONSTANT_INTERVAL_MS;
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
     // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
@@ -224,20 +235,25 @@ async function openWithRetry(system, callerTools) {
       setState('dead', { error: result.msg || result.kind });
       process.exit(1);
     }
-    // AIMD update:
-    if (result.kind === 'rate_limit_soft' || result.kind === 'rate_limit_hard') {
-      const oldWait = currentWait;
-      currentWait = Math.min(WAIT_CEILING_MS, Math.floor(currentWait * WAIT_INCREASE_FACTOR));
-      if (result.kind === 'rate_limit_hard') {
-        send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt}, wait ${oldWait}→${currentWait}ms` });
+    if (RETRY_MODE === 'aimd') {
+      if (result.kind === 'rate_limit_soft' || result.kind === 'rate_limit_hard') {
+        const oldWait = currentWait;
+        currentWait = Math.min(WAIT_CEILING_MS, Math.floor(currentWait * WAIT_INCREASE_FACTOR));
+        if (result.kind === 'rate_limit_hard') {
+          send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt}, wait ${oldWait}→${currentWait}ms` });
+        }
+      } else {
+        currentWait = Math.max(WAIT_FLOOR_MS, currentWait - WAIT_DECREASE_MS);
+      }
+      if (attempt % 20 === 0) {
+        send({ type: 'log', channelId: CHANNEL_ID, level: 'info', message: `aimd: attempt=${attempt} wait=${currentWait}ms last=${result.kind}` });
       }
     } else {
-      currentWait = Math.max(WAIT_FLOOR_MS, currentWait - WAIT_DECREASE_MS);
-    }
-    // Periodic observability: log the AIMD state every 20 attempts so we
-    // can verify channels are converging to a stable wait.
-    if (attempt % 20 === 0) {
-      send({ type: 'log', channelId: CHANNEL_ID, level: 'info', message: `aimd: attempt=${attempt} wait=${currentWait}ms last=${result.kind}` });
+      // constant — log periodically so we still see hard rate-limit hits
+      // surfacing without flooding the log.
+      if (result.kind === 'rate_limit_hard' && attempt % 20 === 0) {
+        send({ type: 'log', channelId: CHANNEL_ID, level: 'warn', message: `RATE_LIMIT_EXCEEDED on attempt ${attempt} (constant retry @${currentWait}ms)` });
+      }
     }
     await sleep(jitter(currentWait));
     continue;
