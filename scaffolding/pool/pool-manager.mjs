@@ -558,6 +558,47 @@ setInterval(() => {
   }
 }, 30_000);
 
+// ── Busy-watchdog ────────────────────────────────────────────────────────
+// A channel that sits in `busy` state past this many ms with no activity
+// (no text_delta / thinking_delta / tool_use / heartbeat — see worker
+// `lastActivityAt` updates in bridge-worker.mjs) is considered stuck. We
+// notify any waiting client with an error and SIGTERM the worker so the
+// existing exit handler refills the slot via maybeSpawnNext.
+//
+// Why this exists: HTTP-layer stall detection in cursor-agent-h1.js and
+// the worker's onTurnEnded handler cover most hang modes (Cursor silent
+// mid-stream, model ends without yield), but a stream that keeps the
+// connection alive without ever delivering a bajie_yield — or an IPC
+// pipe that's silently stalled — would leave the channel busy forever.
+// Idle-ping above only watches `ready` channels, so it can't recover
+// this state.
+//
+// Default 240 s: well above any legitimate single-turn latency we've
+// observed (600k-token NIAH inferences top out around 40 s plus
+// streaming). Tune via RATLC_BUSY_STUCK_TIMEOUT_MS.
+const BUSY_STUCK_TIMEOUT_MS = parseInt(process.env.RATLC_BUSY_STUCK_TIMEOUT_MS || '240000', 10);
+setInterval(() => {
+  const now = Date.now();
+  for (const ch of channels.values()) {
+    if (ch.state !== 'busy') continue;
+    const idleMs = now - (ch.lastActivityAt || 0);
+    if (idleMs < BUSY_STUCK_TIMEOUT_MS) continue;
+    log(`busy-watchdog: ${ch.id} (group=${ch.group}) stuck busy ${Math.floor(idleMs / 1000)}s reqId=${ch.currentRequestId} — killing for respawn`);
+    if (ch.currentRequestId) {
+      const client = requestClient.get(ch.currentRequestId);
+      if (client) {
+        writeToClient(client, {
+          type: 'error',
+          requestId: ch.currentRequestId,
+          message: `busy-watchdog timeout: channel ${ch.id} stuck busy ${Math.floor(idleMs / 1000)}s`,
+        });
+      }
+      requestClient.delete(ch.currentRequestId);
+    }
+    try { ch.proc.kill('SIGTERM'); } catch { /* ignore */ }
+  }
+}, 30_000);
+
 function writeToClient(client, obj) {
   if (!client || client.destroyed) return;
   try {
