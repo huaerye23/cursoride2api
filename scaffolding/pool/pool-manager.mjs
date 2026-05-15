@@ -227,6 +227,19 @@ function recordTokenOtherError(idx, errMsg) {
     log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
   }
 }
+// Definite-fatal kinds (auth_error, quota_exhausted) — Cursor explicitly
+// told us this token is permanently broken (invalid login / account quota
+// exhausted). No retry threshold; mark dead on first strike.
+function killTokenImmediately(idx, errorKind, errMsg) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
+  _tokenOtherErrors[idx]++;
+  if (!_tokenDead[idx]) {
+    _tokenDead[idx] = true;
+    log(`⚠ TOKEN DEAD (${errorKind}): token[${idx}]=${_tokenNames[idx]} marked dead on first strike. Cursor returned ${errorKind === 'auth_error' ? 'auth failure (invalid/expired token)' : 'account quota exhausted'}. lastError="${_tokenLastError[idx]}"`);
+    log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
+  }
+}
 
 const requestQueue = [];
 const toolUseIndex = new Map();
@@ -405,10 +418,15 @@ function handleWorkerMessage(ch, msg) {
 function handleWorkerExit(ch, code, signal) {
   log(`channel ${ch.id} (group=${ch.group}) exited code=${code} signal=${signal} state=${ch.state}${ch.errorKind ? ` errorKind=${ch.errorKind}` : ''}${ch.error ? ` error="${String(ch.error).slice(0, 120)}"` : ''}`);
   // Feed token health: an other_error death on a token that hasn't been
-  // validated counts as a strike. Once strikes >= TOKEN_DEATH_THRESHOLD,
-  // the token gets marked dead and skipped on future spawns.
-  if (ch.errorKind === 'other_error' && typeof ch.tokenIdx === 'number') {
-    recordTokenOtherError(ch.tokenIdx, ch.error);
+  // validated counts as a strike. auth_error and quota_exhausted are
+  // explicit signals from Cursor that the token is broken — mark dead
+  // immediately, no threshold. Once dead, future spawns skip this token.
+  if (typeof ch.tokenIdx === 'number') {
+    if (ch.errorKind === 'auth_error' || ch.errorKind === 'quota_exhausted') {
+      killTokenImmediately(ch.tokenIdx, ch.errorKind, ch.error);
+    } else if (ch.errorKind === 'other_error') {
+      recordTokenOtherError(ch.tokenIdx, ch.error);
+    }
   }
   channels.delete(ch.id);
   const g = groups.get(ch.group);

@@ -199,6 +199,17 @@ function openOnce(initialPrompt, allTools) {
       onError: (err) => {
         const msg = String(err?.message || err || '');
         if (/unpaid invoice|cursor\.com\/dashboard/i.test(msg)) resolve({ kind: 'unpaid', msg });
+        // Permanent per-account auth failure — invalid/expired token.
+        // Cursor returns "Connect error unauthenticated: ... try logging
+        // out and back in [ERROR_NOT_LOGGED_IN]". Definite-fatal for this
+        // token until it's rotated by the user.
+        else if (/ERROR_NOT_LOGGED_IN|unauthenticated/i.test(msg)) resolve({ kind: 'auth_error', msg });
+        // Permanent (or long-cooldown) account quota exhaustion. Cursor
+        // returns "Connect error resource_exhausted: Switched to Composer
+        // 2 after reaching API limit... [ERROR_RATE_LIMITED_CHANGEABLE]".
+        // Different from the soft "Please wait" — this account has hit
+        // its monthly cap, not a per-stream rate limit.
+        else if (/ERROR_RATE_LIMITED_CHANGEABLE|API usage limit/i.test(msg)) resolve({ kind: 'quota_exhausted', msg });
         else if (/RATE_LIMIT_EXCEEDED|too many requests/i.test(msg)) resolve({ kind: 'rate_limit_hard', msg });
         else if (/rate limit/i.test(msg)) resolve({ kind: 'rate_limit_soft', msg });
         else resolve({ kind: 'other_error', msg });
@@ -234,12 +245,15 @@ async function openWithRetry(system, callerTools) {
     // the pool socket cares about.
     setState('opening', { waitMs: currentWait });
     const result = await openOnce(primingPrompt, allTools);
-    // Any non-`other_error` outcome proves the token reached Cursor's
-    // backend past auth — opened, unpaid (probabilistic gate), rate_limit_*
-    // (throttle), or no_yield are all post-auth signals. Tell pool-manager
-    // once, so it can mark this token as validated and exclude future
-    // other_error deaths from the "token is broken" heuristic.
-    if (!tokenValidatedReported && result.kind !== 'other_error') {
+    // Any kind in this validation set proves the token reached Cursor's
+    // backend past auth — opened, unpaid (probabilistic gate),
+    // rate_limit_* (throttle), or no_yield are all post-auth signals.
+    // Tell pool-manager once so it can mark this token as validated and
+    // exclude future other_error deaths from the "token is broken"
+    // heuristic. auth_error / quota_exhausted / other_error do NOT
+    // validate the token — they mean it never got through.
+    const VALIDATING_KINDS = ['opened', 'unpaid', 'rate_limit_soft', 'rate_limit_hard', 'no_yield'];
+    if (!tokenValidatedReported && VALIDATING_KINDS.includes(result.kind)) {
       send({ type: 'token_validated', channelId: CHANNEL_ID, tokenIdx: _tokenIdx, kind: result.kind });
       tokenValidatedReported = true;
     }
@@ -251,6 +265,14 @@ async function openWithRetry(system, callerTools) {
       attachLiveCallbacks();
       setState('ready');
       return;
+    }
+    // Definite-fatal kinds: token is invalid (auth) or account quota
+    // exhausted. No point retrying within this worker — exit and report
+    // a specific errorKind so pool-manager can mark the token dead on
+    // the first strike, not after the conservative 3-strike threshold.
+    if (result.kind === 'auth_error' || result.kind === 'quota_exhausted') {
+      setState('dead', { error: result.msg || result.kind, errorKind: result.kind });
+      process.exit(1);
     }
     if (result.kind === 'other_error') {
       setState('dead', { error: result.msg || result.kind, errorKind: 'other_error' });

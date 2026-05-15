@@ -472,22 +472,34 @@ async function cmdTui() {
     const tokens = Array.isArray(pool.tokens) ? pool.tokens : [];
     if (tokens.length > 1) {
       out.push('');
-      const tw = [4, 18, 12, 7, 9];
-      const thdr = ['IDX', 'NAME', 'VALIDATED', 'DEAD', 'OTHERERR'];
-      out.push('  ' + thdr.map((h, i) => color(rpad(h, tw[i]), ANSI.bold)).join(' '));
+      // ERROR_WIDTH: fit the message in the remaining terminal columns.
+      // Conservative default 80; truncated cleanly per-row below.
+      const termCols = process.stdout.columns || 132;
+      const tw = [4, 18, 12, 6, 9];
+      const fixedWidth = tw.reduce((a, b) => a + b, 0) + 5 /* separators */ + 3 /* '  ' indent */;
+      const errWidth = Math.max(20, Math.min(120, termCols - fixedWidth - 2));
+      const thdr = ['IDX', 'NAME', 'VALIDATED', 'DEAD', 'OTHERERR', 'LAST_ERROR'];
+      out.push('  ' + thdr.slice(0, 5).map((h, i) => color(rpad(h, tw[i]), ANSI.bold)).join(' ') + ' ' + color(thdr[5], ANSI.bold));
       for (const t of tokens) {
         const valTxt = t.validated ? color('✓ yes', ANSI.green) : color('✗ no', ANSI.yellow);
         const deadTxt = t.dead ? color('YES', ANSI.red + ANSI.bold) : color('no', ANSI.gray);
-        const errTxt = t.otherErrorCount > 0
-          ? color(String(t.otherErrorCount), t.dead ? ANSI.red : ANSI.yellow)
+        const errCount = t.otherErrorCount || 0;
+        const errCntTxt = errCount > 0
+          ? color(String(errCount), t.dead ? ANSI.red : ANSI.yellow)
           : color('0', ANSI.gray);
+        const lastErrRaw = t.lastError ? String(t.lastError).replace(/\s+/g, ' ').slice(0, errWidth) : '';
+        const lastErrTxt = !lastErrRaw
+          ? color('-', ANSI.gray)
+          : t.dead
+            ? color(lastErrRaw, ANSI.red)
+            : color(lastErrRaw, ANSI.yellow);
         out.push('  ' + [
           rpad(String(t.idx), tw[0]),
           rpad(t.name || '?', tw[1]),
           rpad(valTxt, tw[2]),
           rpad(deadTxt, tw[3]),
-          rpad(errTxt, tw[4]),
-        ].join(' '));
+          rpad(errCntTxt, tw[4]),
+        ].join(' ') + ' ' + lastErrTxt);
       }
     }
 
