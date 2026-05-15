@@ -472,20 +472,31 @@ async function cmdTui() {
     if (pool.channels?.length) {
       // Channel table — sectioned by group when there's more than one group,
       // flat (today's behavior) when only one.
-      const w = [10, 10, 8, 9, 8, 8, 7, 22];
-      const hdr = ['CHANNEL', 'STATE', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
+      const w = [10, 10, 7, 8, 9, 8, 8, 7, 22];
+      const hdr = ['CHANNEL', 'STATE', 'BUSY', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
 
       function emitRow(ch) {
         const c = STATE_COLOR[ch.state] || '';
+        // BUSY column: time in current turn. Colored yellow at >3 min, red
+        // at >4 min (busy-watchdog default kill threshold).
+        let busyTxt = '-';
+        if (ch.state === 'busy' && ch.busyAt) {
+          const busyMs = Date.now() - ch.busyAt;
+          const fmt = fmtAgo(ch.busyAt);
+          if (busyMs > 240_000) busyTxt = color(fmt, ANSI.red);
+          else if (busyMs > 180_000) busyTxt = color(fmt, ANSI.yellow);
+          else busyTxt = fmt;
+        }
         return [
           rpad(ch.id, w[0]),
           rpad(c + ch.state + ANSI.reset, w[1]),
-          rpad(String(ch.pid || '-'), w[2]),
-          rpad(String(ch.openAttempts || 0), w[3]),
-          rpad(fmtAgo(ch.openedAt), w[4]),
-          rpad(fmtAgo(ch.lastActivityAt), w[5]),
-          rpad(String(ch.roundsServed || 0), w[6]),
-          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[7]),
+          rpad(busyTxt, w[2]),
+          rpad(String(ch.pid || '-'), w[3]),
+          rpad(String(ch.openAttempts || 0), w[4]),
+          rpad(fmtAgo(ch.openedAt), w[5]),
+          rpad(fmtAgo(ch.lastActivityAt), w[6]),
+          rpad(String(ch.roundsServed || 0), w[7]),
+          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[8]),
         ].join(' ');
       }
 

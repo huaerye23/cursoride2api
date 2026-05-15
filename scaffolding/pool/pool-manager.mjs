@@ -238,6 +238,7 @@ function spawnChannel(group) {
     openedAt: 0,
     lastActivityAt: Date.now(),
     spawnedAt: Date.now(),
+    busyAt: null,
     currentRequestId: null,
     pendingExecId: null,
     pendingAnthropicId: null,
@@ -288,6 +289,9 @@ function handleWorkerMessage(ch, msg) {
       ch.openedAt = msg.openedAt || ch.openedAt;
       ch.lastActivityAt = msg.lastActivityAt || ch.lastActivityAt;
       ch.error = msg.error || null;
+      // Worker-driven state change: if it just left 'busy', reset busyAt
+      // so the TUI's BUSY column collapses back to '-'.
+      if (msg.state !== 'busy') ch.busyAt = null;
       if (msg.state === 'ready') {
         log(`channel ${ch.id} (group=${ch.group}) READY after ${ch.openAttempts} attempts (${((Date.now() - ch.spawnedAt) / 1000).toFixed(1)}s)`);
         const g = groups.get(ch.group);
@@ -503,6 +507,7 @@ function routeRequest(job, pick) {
   const ch = pick.channel;
   ch.currentRequestId = job.requestId;
   ch.state = 'busy';
+  ch.busyAt = Date.now();
   ch.lastActivityAt = Date.now();
   requestClient.set(job.requestId, job.client);
   writeToClient(job.client, {
@@ -548,6 +553,7 @@ setInterval(() => {
     log(`pinging idle ${ch.id} (group=${ch.group}, idle for ${Math.floor((now - ch.lastActivityAt) / 1000)}s)`);
     ch.currentRequestId = pingReqId;
     ch.state = 'busy';
+    ch.busyAt = now;
     ch.lastActivityAt = now;
     const pingTimer = setTimeout(() => {
       log(`ping timeout on ${ch.id}; killing for respawn`);
@@ -676,6 +682,7 @@ function handleClientMessage(client, msg) {
       log(`  ✅ routing to ${entry.channelId} (group=${ch.group}) execId=${entry.execId} (state was ${ch.state})`);
       ch.currentRequestId = requestId;
       ch.state = 'busy';
+      ch.busyAt = Date.now();
       ch.lastActivityAt = Date.now();
       requestClient.set(requestId, client);
       writeToClient(client, {
@@ -724,6 +731,7 @@ function handleClientMessage(client, msg) {
       log(`  ✅ routing ${resolved.length} result(s) to ${channelId} (group=${ch.group}) execIds=[${resolved.map(r => r.execId).join(', ')}] (state was ${ch.state})`);
       ch.currentRequestId = requestId;
       ch.state = 'busy';
+      ch.busyAt = Date.now();
       ch.lastActivityAt = Date.now();
       requestClient.set(requestId, client);
       writeToClient(client, {
@@ -914,6 +922,8 @@ function statusSnapshot() {
       openedAgoMs: ch.openedAt ? now - ch.openedAt : null,
       lastActivityAt: ch.lastActivityAt,
       idleMs: ch.lastActivityAt ? now - ch.lastActivityAt : null,
+      busyAt: ch.busyAt,
+      busyForMs: ch.state === 'busy' && ch.busyAt ? now - ch.busyAt : null,
       roundsServed: ch.roundsServed,
       currentRequestId: ch.currentRequestId,
       error: ch.error,
