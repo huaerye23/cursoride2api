@@ -361,26 +361,33 @@ async function handleMessagesRequest(req, res) {
   let done = false;
   let toolUseEmitted = false;
   // Parallel-tool-calls fix: after each tool_use, arm a *watchdog* timer.
-  // The PRIMARY finalize signal during a tool_use turn is `step_completed`
-  // from the worker (which mirrors cursor-agent's `interactionUpdate.
-  // stepCompleted`). This watchdog only fires if step_completed never
-  // arrives — a true anomaly. The previous 250 ms value was acting as a
-  // de-facto primary finalize signal, beating step_completed when the
-  // model emitted tool_uses with >250 ms gaps. That orphaned every
-  // tool_use the model emitted after the timer fired (the worker still
-  // held them in pendingMcpInfo with no corresponding result coming
-  // back), leaving the channel stuck busy forever.
   //
-  // 30 s is comfortably above any legitimate inter-tool_use gap (the
-  // model would have to be totally silent for that long while still
-  // mid-step). When this fires, log it loudly. The new env var name is
-  // POOL_TOOL_USE_WATCHDOG_MS; POOL_TOOL_USE_DEBOUNCE_MS is kept as a
-  // fallback for existing deployments but should be retired.
+  // In theory the primary finalize signal during a tool_use turn is
+  // `step_completed` from the worker (which mirrors cursor-agent's
+  // `interactionUpdate.stepCompleted`). EMPIRICALLY though, the
+  // `*-thinking-fast` Cursor variants we use don't emit stepCompleted
+  // reliably — observed 0 step_completed events across many turns
+  // 2026-05-15 — so the watchdog is the de-facto primary signal in
+  // practice, not just a fallback. Each new tool_use resets the timer,
+  // so as long as parallel tool_uses arrive within this window of each
+  // other they're all batched into the same SSE message.
+  //
+  // Default 1000ms: observed inter-tool_use gaps within a single step
+  // range from 150ms to 480ms; 1s gives comfortable headroom. If you
+  // see "WATCHDOG" log lines AND find that the model still had more
+  // tool_uses to emit after firing (the orphan bug), bump this higher
+  // via POOL_TOOL_USE_WATCHDOG_MS. The busy-watchdog in pool-manager
+  // (240s default) is the ultimate safety net for any channels that
+  // do get stuck.
+  //
+  // POOL_TOOL_USE_DEBOUNCE_MS is kept as an env-var fallback for
+  // backwards compat but should be retired in favor of
+  // POOL_TOOL_USE_WATCHDOG_MS.
   let toolUseFinishTimer = null;
   const TOOL_USE_WATCHDOG_MS = parseInt(
     process.env.POOL_TOOL_USE_WATCHDOG_MS
       || process.env.POOL_TOOL_USE_DEBOUNCE_MS
-      || '30000',
+      || '1000',
     10,
   );
   function armToolUseFinalizer() {
@@ -388,7 +395,7 @@ async function handleMessagesRequest(req, res) {
     toolUseFinishTimer = setTimeout(() => {
       toolUseFinishTimer = null;
       if (done) return;
-      log(`  ⚠ finalize tool_use turn (WATCHDOG @${TOOL_USE_WATCHDOG_MS}ms — step_completed never arrived) requestId=${requestId}`);
+      log(`  → finalize tool_use turn (WATCHDOG @${TOOL_USE_WATCHDOG_MS}ms — step_completed never arrived) requestId=${requestId}`);
       stopReason = 'tool_use';
       finishMessage();
     }, TOOL_USE_WATCHDOG_MS);
