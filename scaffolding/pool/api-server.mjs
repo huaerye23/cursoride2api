@@ -474,6 +474,11 @@ async function handleMessagesRequest(req, res) {
   function finishMessage() {
     if (done) return;
     done = true;
+    // Disarm watchdog centrally so the bookkeeping is symmetric across all
+    // exit paths (step_completed / yield / error / watchdog / disconnect).
+    // The watchdog-fired path used to leave a dangling reference because
+    // the disarm was at the call sites of the other paths only.
+    disarmToolUseFinalizer();
     stopTextBlock();
     // Commit any accumulated thinking text into a stored turn under this
     // convKey BEFORE emitting message_stop. Each /v1/messages POST maps
@@ -523,15 +528,30 @@ async function handleMessagesRequest(req, res) {
         return;
       }
       if (msg.type === 'text_delta') {
+        if (done) return;
         emitTextDelta(msg.text);
+        // Re-arm the tool_use watchdog on any model-originated stream
+        // activity. The watchdog measures "model has gone silent" — text
+        // and thinking deltas between tool_uses within the same step are
+        // normal model output and should keep the timer alive. Without
+        // this re-arm, a single text_delta or long-thinking gap >
+        // WATCHDOG_MS would fire the watchdog mid-step, finalize the
+        // turn, and orphan any subsequent tool_use the model emits (model
+        // waits forever for results that claude-code never gets — channel
+        // sits busy until the 240s busy-watchdog reaps it). See
+        // WATCHDOG_REARM_REVIEW.md Issue 1.
+        if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'thinking_delta') {
+        if (done) return;
         // Capture thinking text into the per-convKey buffer for re-injection
         // on the NEXT turn. Do NOT forward to the client SSE — Anthropic's
         // signed thinking blocks need a signature we can't produce, and
         // emitting unsigned blocks poisons claude-code's session against
         // direct-Anthropic resume (see DEVLOG re `_emitThinkingBlocks=false`).
         if (POOL_REINJECT_THINKING) thinkingBuffer.append(convKey, msg.text || '');
+        if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'tool_use') {
+        if (done) return;
         // Parallel-tool-calls fix: emit the tool_use block but DO NOT finish
         // the message here. The model may emit several tool_uses in a single
         // assistant turn — each must get its own content_block_start with a
@@ -539,11 +559,14 @@ async function handleMessagesRequest(req, res) {
         //   (a) the pool reports `step_completed` (the model has finished
         //       emitting this step's tool_uses and is now waiting on results) —
         //       PRIMARY signal, finalize immediately, OR
-        //   (b) the watchdog (default 30 s) fires — last-resort fallback
-        //       only used when step_completed never arrives; firing this
-        //       finalizes the turn but any tool_uses the model emits
-        //       after will orphan, so a watchdog firing is a real anomaly
-        //       worth investigating, OR
+        //   (b) the watchdog (default 1 s) fires — empirically primary
+        //       on *-thinking-fast variants that don't emit
+        //       step_completed at all. Re-armed on every text_delta /
+        //       thinking_delta too, so the timer measures "model went
+        //       silent" rather than "no more tool_uses". Firing without
+        //       a step_completed is normal for these models; firing
+        //       with subsequent tool_uses still pending would orphan
+        //       them, hence the re-arm. OR
         //   (c) the pool reports `yield` (end_turn case — the model never
         //       called any tool, only text).
         //
@@ -553,6 +576,43 @@ async function handleMessagesRequest(req, res) {
         // Cursor tool has no Anthropic equivalent, we silently reject
         // back to the inner agent by sending a tool_error result via
         // the pool socket — the agent picks a different approach.
+
+        // Spoof rejection: model emits Write with file_path matching the
+        // WebSearch backend-FS sentinel (`agent-tools/<uuid>.txt`) and
+        // empty content. This is the model "counterfeiting a WebSearch
+        // result" — creating the file that Cursor's WebSearch would have
+        // written, then narrating around it without actually fetching
+        // anything. See scaffolding/pool/AGENT_TOOLS_SPOOF_OBSERVATION.md
+        // for the full diagnosis. Break the spoof loudly: instead of
+        // forwarding to claude-code (which would silently create a 0-byte
+        // file), respond with a synthetic tool_error so the model gets a
+        // clear "don't do this; use WebSearch instead" signal.
+        if (msg.name === 'Write') {
+          const fp = msg.args?.file_path || '';
+          const content = msg.args?.content || '';
+          const uuidV4Path = /^agent-tools\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$/i;
+          if (uuidV4Path.test(fp) && String(content).trim() === '') {
+            log(`⚠ rejecting Write spoof: empty Write to ${fp} (WebSearch sentinel-spoof pattern) requestId=${requestId}`);
+            poolWrite({
+              type: 'request',
+              requestId: requestId + ':spoof_reject',
+              action: 'send_tool_results',
+              model: model || null,
+              results: [{
+                anthropic_tool_use_id: msg.anthropic_id,
+                content:
+                  '[proxy_error] Refusing this Write: `agent-tools/<uuid>.txt` paths are ' +
+                  'reserved for WebSearch result writebacks (Cursor backend internal convention). ' +
+                  "Writing an empty file there doesn't fetch anything — it's a known model " +
+                  'confabulation pattern where the assistant counterfeits a WebSearch result. ' +
+                  'To actually search the web, call the WebSearch tool with a query, or use ' +
+                  'Bash with curl/wget. Do not retry this Write.',
+              }],
+            });
+            return;
+          }
+        }
+
         if (POOL_TOOL_MODE === 'translate' && !isInternalTool(msg.name)) {
           const xlated = cursorToAnthropic(msg.name, msg.args || {});
           if (!xlated.ok) {
@@ -597,20 +657,17 @@ async function handleMessagesRequest(req, res) {
         // watchdog above is only a fallback for the case this never fires.
         if (toolUseEmitted && !done) {
           log(`  → finalize tool_use turn (step_completed) requestId=${requestId}`);
-          disarmToolUseFinalizer();
           stopReason = 'tool_use';
-          finishMessage();
+          finishMessage();  // disarms the watchdog centrally
         }
       } else if (msg.type === 'yield') {
         // The model called bajie_yield. If any tool_uses were emitted this
         // turn (rare — usually finalize happens earlier via step_completed
         // or the watchdog), stop_reason='tool_use'. Otherwise the model
         // sent pure-text and then yielded — that's stop_reason='end_turn'.
-        disarmToolUseFinalizer();
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
         finishMessage();
       } else if (msg.type === 'error') {
-        disarmToolUseFinalizer();
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
         if (blockIdx === -1) startMsg();
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
@@ -669,8 +726,7 @@ async function handleMessagesRequest(req, res) {
   req.on('close', () => {
     if (!done) {
       log(`client disconnected mid-stream for ${requestId}`);
-      disarmToolUseFinalizer();
-      finishMessage();
+      finishMessage();  // disarms the watchdog centrally
     }
   });
 }

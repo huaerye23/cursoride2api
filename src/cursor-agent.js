@@ -549,9 +549,10 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
 
   // ── passthrough native tools ────────────────────────────────────────────
   // When passthroughNativeTools is enabled, instead of rejecting native tool
-  // calls (shellArgs / readArgs / writeArgs / fetchArgs), translate them to
-  // MCP-shape tool_use events the caller can handle. sendToolResult later
-  // dispatches to the right native result schema by consulting nativeExecKinds.
+  // calls (shellArgs / readArgs / writeArgs / fetchArgs / grepArgs /
+  // shellStreamArgs / backgroundShellSpawnArgs), translate them to MCP-shape
+  // tool_use events the caller can handle. sendToolResult later dispatches
+  // to the right native result schema by consulting nativeExecKinds.
   if (passthroughNative && nativeExecKinds) {
     if (msgCase === 'shellArgs') {
       const args = {
@@ -604,12 +605,23 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'write-passthrough';
     }
     if (msgCase === 'fetchArgs') {
+      // Cursor's FetchArgs proto only carries `url` and `tool_call_id` —
+      // there's no model-supplied prompt/query field. Previously we
+      // hardcoded "Summarize this content." which biased every WebFetch
+      // toward a summary regardless of what the model actually wanted to
+      // extract (a price, a date, a structured field). Switch to a neutral
+      // "return the content as-is" instruction so claude-code's WebFetch
+      // extraction layer doesn't pre-summarize. See WEBSEARCH_WEBFETCH_REVIEW.md
+      // Issue 3 for context.
       nativeExecKinds.set(execId, { kind: 'fetch', url: msgValue?.url || '' });
       onMcpCall({
         id, execId,
         toolCallId: `native-fetch-${execId.slice(0, 8)}`,
         toolName: 'WebFetch',
-        args: { url: msgValue?.url || '', prompt: 'Summarize this content.' },
+        args: {
+          url: msgValue?.url || '',
+          prompt: 'Return the page content as-is for the calling model to interpret. Do not summarize, do not filter.',
+        },
       });
       return 'fetch-passthrough';
     }
@@ -869,18 +881,19 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
         traceInteraction('reject', `reason="${REJECT_REASON}"`);
       }
       break;
-    case 'webFetchRequestQuery':
-      // Note: WebFetchRequest* schemas are NOT in the vendored proto (grep
-      // src/proto/agent_pb.mjs returns no matches). The actual InteractionQuery
-      // oneof in the vendored proto doesn't include webFetchRequestQuery either
-      // (see descriptor probe), so this branch is unreachable — keeping it as
-      // a placeholder for a future proto regen.
-      resultCase = 'webFetchRequestResponse';
-      resultValue = create(A.WebFetchRequestResponseSchema, {
-        result: { case: 'rejected', value: create(A.WebFetchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
-      });
-      traceInteraction('reject');
-      break;
+    // Note: there was a `case 'webFetchRequestQuery'` branch here that
+    // explicitly rejected, but WebFetchRequest* schemas aren't in the
+    // vendored proto and the InteractionQuery oneof doesn't include the
+    // case, so it was dead code. Removed deliberately (rather than left
+    // as a placeholder) because the symmetric pre-`f6cc478` behavior is
+    // for unknown cases to fall through to the `default` branch, which
+    // abandons the response — the model then falls back to the
+    // `mcp_WebFetch` MCP-prefixed tool that we forward through to
+    // claude-code. That's the correct end-state and matches WebSearch's
+    // pre-fix behavior, so if/when proto regen adds webFetchRequestQuery
+    // we want it to land in the abandon path, NOT in a stale reject path
+    // (which would silently break passthrough). See
+    // WEBSEARCH_WEBFETCH_REVIEW.md Issue 4 for context.
     case 'exaSearchRequestQuery':
       resultCase = 'exaSearchRequestResponse';
       resultValue = create(A.ExaSearchRequestResponseSchema, {
@@ -1569,8 +1582,40 @@ function startConversation(token, options = {}) {
         }
         return;
       }
-      // Misc updates we don't render: toolCallStarted/Delta/Completed,
-      // partialToolCall, summary*, shellOutputDelta, userMessageAppended
+      // Server-side tool-call completion telemetry. For WebSearch
+      // specifically (approved via the InteractionResponse path; runs on
+      // Cursor's backend), log the byte-count so deployments running with
+      // CURSOR_LOG_INTERACTION=1 have a trail of every backend-executed
+      // search. The result text itself is folded into the model's context
+      // by Cursor's backend before we see this envelope — we cannot rewrite
+      // it from here. See WEBSEARCH_WEBFETCH_REVIEW.md Issues 1 and 2 for
+      // the broader observability gap.
+      if (iuCase === 'toolCallCompleted' && process.env.CURSOR_LOG_INTERACTION === '1') {
+        try {
+          const tc = iuVal?.toolCall;
+          const inner = tc?.value;
+          const innerCase = tc?.case;
+          if (innerCase === 'webSearchToolCall') {
+            const result = inner?.result;
+            const resultCase = result?.case;
+            let byteCount = 0;
+            let summary = '';
+            try {
+              const innerVal = result?.value;
+              if (innerVal?.results && Array.isArray(innerVal.results)) {
+                for (const r of innerVal.results) {
+                  byteCount += (r?.content || '').length;
+                }
+                summary = `${innerVal.results.length} results`;
+              }
+            } catch { /* ignore introspection failures */ }
+            console.log(`[cursor-agent] backend webSearchToolCall complete case=${resultCase} bytes=${byteCount} ${summary}`);
+          }
+        } catch { /* ignore */ }
+      }
+      // Misc updates we don't render: toolCallStarted/Delta (WebSearch
+      // streams progress here), partialToolCall, summary*, shellOutputDelta,
+      // userMessageAppended.
       return;
     }
     if (msgCase === 'conversationCheckpointUpdate') {
