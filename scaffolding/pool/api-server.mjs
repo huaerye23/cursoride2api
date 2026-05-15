@@ -360,22 +360,38 @@ async function handleMessagesRequest(req, res) {
   let stopReason = 'end_turn';
   let done = false;
   let toolUseEmitted = false;
-  // Parallel-tool-calls fix: after the first tool_use, arm a debounce
-  // backstop. If `step_completed` arrives via the pool first, we finalize
-  // immediately. The 250 ms is a safety net for environments where
-  // stepCompleted isn't bubbled or is late. Mirrors server.js (lines
-  // 677-682) for the legacy direct path.
+  // Parallel-tool-calls fix: after each tool_use, arm a *watchdog* timer.
+  // The PRIMARY finalize signal during a tool_use turn is `step_completed`
+  // from the worker (which mirrors cursor-agent's `interactionUpdate.
+  // stepCompleted`). This watchdog only fires if step_completed never
+  // arrives — a true anomaly. The previous 250 ms value was acting as a
+  // de-facto primary finalize signal, beating step_completed when the
+  // model emitted tool_uses with >250 ms gaps. That orphaned every
+  // tool_use the model emitted after the timer fired (the worker still
+  // held them in pendingMcpInfo with no corresponding result coming
+  // back), leaving the channel stuck busy forever.
+  //
+  // 30 s is comfortably above any legitimate inter-tool_use gap (the
+  // model would have to be totally silent for that long while still
+  // mid-step). When this fires, log it loudly. The new env var name is
+  // POOL_TOOL_USE_WATCHDOG_MS; POOL_TOOL_USE_DEBOUNCE_MS is kept as a
+  // fallback for existing deployments but should be retired.
   let toolUseFinishTimer = null;
-  const TOOL_USE_DEBOUNCE_MS = parseInt(process.env.POOL_TOOL_USE_DEBOUNCE_MS || '250', 10);
+  const TOOL_USE_WATCHDOG_MS = parseInt(
+    process.env.POOL_TOOL_USE_WATCHDOG_MS
+      || process.env.POOL_TOOL_USE_DEBOUNCE_MS
+      || '30000',
+    10,
+  );
   function armToolUseFinalizer() {
     if (toolUseFinishTimer) clearTimeout(toolUseFinishTimer);
     toolUseFinishTimer = setTimeout(() => {
       toolUseFinishTimer = null;
       if (done) return;
-      log(`  → finalize tool_use turn (debounce backstop) requestId=${requestId}`);
+      log(`  ⚠ finalize tool_use turn (WATCHDOG @${TOOL_USE_WATCHDOG_MS}ms — step_completed never arrived) requestId=${requestId}`);
       stopReason = 'tool_use';
       finishMessage();
-    }, TOOL_USE_DEBOUNCE_MS);
+    }, TOOL_USE_WATCHDOG_MS);
   }
   function disarmToolUseFinalizer() {
     if (toolUseFinishTimer) {
@@ -515,9 +531,12 @@ async function handleMessagesRequest(req, res) {
         // distinct index. We only finish the response when:
         //   (a) the pool reports `step_completed` (the model has finished
         //       emitting this step's tool_uses and is now waiting on results) —
-        //       immediate finalize, OR
-        //   (b) the 250 ms debounce backstop fires (if step_completed is
-        //       delayed or missing), OR
+        //       PRIMARY signal, finalize immediately, OR
+        //   (b) the watchdog (default 30 s) fires — last-resort fallback
+        //       only used when step_completed never arrives; firing this
+        //       finalizes the turn but any tool_uses the model emits
+        //       after will orphan, so a watchdog firing is a real anomaly
+        //       worth investigating, OR
         //   (c) the pool reports `yield` (end_turn case — the model never
         //       called any tool, only text).
         //
@@ -557,17 +576,18 @@ async function handleMessagesRequest(req, res) {
           emitToolUseBlock(msg.anthropic_id, msg.name, msg.args);
         }
         // Mark that we should end with stop_reason='tool_use' when the
-        // turn finalizes. Arm the debounce backstop after every tool_use
-        // (each new one resets the timer — more may still arrive).
+        // turn finalizes. Arm the watchdog after every tool_use (each new
+        // one resets the timer — more may still arrive). The watchdog
+        // only fires if step_completed never comes; on the common path
+        // step_completed fires first and cancels it.
         stopReason = 'tool_use';
         armToolUseFinalizer();
       } else if (msg.type === 'step_completed') {
         // The pool's bridge-worker observed `interactionUpdate.stepCompleted`
         // from cursor-agent. If any tool_uses have been emitted on this
         // turn, the model is now paused waiting for the tool_result(s).
-        // Finalize the SSE immediately — saves the 250 ms debounce on the
-        // common single-tool case, and is the deterministic signal in the
-        // parallel-tools case.
+        // This is the DETERMINISTIC, PRIMARY finalize signal — the
+        // watchdog above is only a fallback for the case this never fires.
         if (toolUseEmitted && !done) {
           log(`  → finalize tool_use turn (step_completed) requestId=${requestId}`);
           disarmToolUseFinalizer();
@@ -577,7 +597,7 @@ async function handleMessagesRequest(req, res) {
       } else if (msg.type === 'yield') {
         // The model called bajie_yield. If any tool_uses were emitted this
         // turn (rare — usually finalize happens earlier via step_completed
-        // or the debounce), stop_reason='tool_use'. Otherwise the model
+        // or the watchdog), stop_reason='tool_use'. Otherwise the model
         // sent pure-text and then yielded — that's stop_reason='end_turn'.
         disarmToolUseFinalizer();
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
