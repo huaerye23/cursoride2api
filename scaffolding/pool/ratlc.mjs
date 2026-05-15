@@ -468,6 +468,29 @@ async function cmdTui() {
       }
     }
 
+    // Token-health table (only shown when there's more than one token).
+    const tokens = Array.isArray(pool.tokens) ? pool.tokens : [];
+    if (tokens.length > 1) {
+      out.push('');
+      const tw = [4, 18, 12, 7, 9];
+      const thdr = ['IDX', 'NAME', 'VALIDATED', 'DEAD', 'OTHERERR'];
+      out.push('  ' + thdr.map((h, i) => color(rpad(h, tw[i]), ANSI.bold)).join(' '));
+      for (const t of tokens) {
+        const valTxt = t.validated ? color('✓ yes', ANSI.green) : color('✗ no', ANSI.yellow);
+        const deadTxt = t.dead ? color('YES', ANSI.red + ANSI.bold) : color('no', ANSI.gray);
+        const errTxt = t.otherErrorCount > 0
+          ? color(String(t.otherErrorCount), t.dead ? ANSI.red : ANSI.yellow)
+          : color('0', ANSI.gray);
+        out.push('  ' + [
+          rpad(String(t.idx), tw[0]),
+          rpad(t.name || '?', tw[1]),
+          rpad(valTxt, tw[2]),
+          rpad(deadTxt, tw[3]),
+          rpad(errTxt, tw[4]),
+        ].join(' '));
+      }
+    }
+
     out.push('');
     if (pool.channels?.length) {
       // Channel table — sectioned by group when there's more than one group,

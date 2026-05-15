@@ -225,6 +225,7 @@ async function openWithRetry(system, callerTools) {
   // every response (multiplicative back-off on rate-limit, additive ramp
   // toward floor otherwise).
   let currentWait = RETRY_MODE === 'aimd' ? INITIAL_WAIT_MS : CONSTANT_INTERVAL_MS;
+  let tokenValidatedReported = false;
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
     // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
@@ -233,6 +234,15 @@ async function openWithRetry(system, callerTools) {
     // the pool socket cares about.
     setState('opening', { waitMs: currentWait });
     const result = await openOnce(primingPrompt, allTools);
+    // Any non-`other_error` outcome proves the token reached Cursor's
+    // backend past auth — opened, unpaid (probabilistic gate), rate_limit_*
+    // (throttle), or no_yield are all post-auth signals. Tell pool-manager
+    // once, so it can mark this token as validated and exclude future
+    // other_error deaths from the "token is broken" heuristic.
+    if (!tokenValidatedReported && result.kind !== 'other_error') {
+      send({ type: 'token_validated', channelId: CHANNEL_ID, tokenIdx: _tokenIdx, kind: result.kind });
+      tokenValidatedReported = true;
+    }
     if (result.kind === 'opened') {
       bridge = result.bridge;
       pendingYield = result.yieldInfo;
@@ -243,7 +253,7 @@ async function openWithRetry(system, callerTools) {
       return;
     }
     if (result.kind === 'other_error') {
-      setState('dead', { error: result.msg || result.kind });
+      setState('dead', { error: result.msg || result.kind, errorKind: 'other_error' });
       process.exit(1);
     }
     if (RETRY_MODE === 'aimd') {
@@ -269,7 +279,7 @@ async function openWithRetry(system, callerTools) {
     await sleep(jitter(currentWait));
     continue;
   }
-  setState('dead', { error: 'open exhausted' });
+  setState('dead', { error: 'open exhausted', errorKind: 'exhausted' });
   process.exit(1);
 }
 

@@ -163,12 +163,20 @@ function parsePoolGroupsEnv() {
 let nextChannelSeq = 0;
 const channels = new Map();
 
-// ── Token rotation ───────────────────────────────────────────────────────
+// ── Token rotation + health ──────────────────────────────────────────────
 // token.json is shaped { tokens: [{name, accessToken, machineId, macMachineId}, ...] }.
-// Round-robin assignment at spawn time: channel N gets tokens[N % count].
+// Round-robin assignment at spawn time: channel N gets the next live token.
 // Spreads soft-rate-limit pressure across multiple accounts when more than
 // one token is present. With a single token in the file (the typical case)
 // every channel still uses tokens[0] — identical to the previous behavior.
+//
+// Health tracking: each spawned bridge-worker reports `token_validated` the
+// first time it gets a post-auth response from Cursor (opened / unpaid /
+// rate_limit_* / no_yield — anything that isn't `other_error`). If a token's
+// workers die with `errorKind: 'other_error'` N consecutive times without
+// EVER reporting validation, the token is marked dead and skipped in the
+// rotation. This is fast detection: at typical retry rates, 3 strikes
+// surface within 15-90s.
 const _tokenPath = path.resolve(__dirname, '..', '..', 'token.json');
 let _tokenCount = 1;
 let _tokenNames = ['(default)'];
@@ -181,12 +189,43 @@ try {
 } catch (e) {
   log(`WARN: failed to read ${_tokenPath} for rotation count: ${e.message} — assuming single token`);
 }
-log(`token rotation: ${_tokenCount} token(s) loaded — [${_tokenNames.join(', ')}]`);
+const TOKEN_DEATH_THRESHOLD = parseInt(process.env.RATLC_TOKEN_DEATH_THRESHOLD || '3', 10);
+const _tokenValidated = new Array(_tokenCount).fill(false);
+const _tokenOtherErrors = new Array(_tokenCount).fill(0);
+const _tokenDead = new Array(_tokenCount).fill(false);
+const _tokenLastError = new Array(_tokenCount).fill(null);
+log(`token rotation: ${_tokenCount} token(s) loaded — [${_tokenNames.join(', ')}], death-threshold=${TOKEN_DEATH_THRESHOLD}`);
 let _nextTokenIdx = 0;
 function nextTokenIndex() {
-  const idx = _nextTokenIdx % _tokenCount;
-  _nextTokenIdx = (_nextTokenIdx + 1) % _tokenCount;
-  return idx;
+  // Try up to _tokenCount steps to find a live token. If all are dead, fall
+  // through to index 0 anyway with a critical log — better to keep trying
+  // than to freeze the pool.
+  for (let i = 0; i < _tokenCount; i++) {
+    const idx = _nextTokenIdx % _tokenCount;
+    _nextTokenIdx = (_nextTokenIdx + 1) % _tokenCount;
+    if (!_tokenDead[idx]) return idx;
+  }
+  log('CRITICAL: every token is marked dead; falling back to index 0 anyway');
+  return 0;
+}
+function markTokenValidated(idx) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  if (!_tokenValidated[idx]) {
+    log(`token[${idx}]=${_tokenNames[idx]} validated (reached Cursor past auth)`);
+  }
+  _tokenValidated[idx] = true;
+  _tokenOtherErrors[idx] = 0;  // reset strike count
+}
+function recordTokenOtherError(idx, errMsg) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
+  if (_tokenValidated[idx]) return;  // proven good before, this is a transient
+  _tokenOtherErrors[idx]++;
+  if (_tokenOtherErrors[idx] >= TOKEN_DEATH_THRESHOLD && !_tokenDead[idx]) {
+    _tokenDead[idx] = true;
+    log(`⚠ TOKEN DEAD: token[${idx}]=${_tokenNames[idx]} marked dead after ${_tokenOtherErrors[idx]} consecutive other_error failures with no validation. lastError="${_tokenLastError[idx]}"`);
+    log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
+  }
 }
 
 const requestQueue = [];
@@ -320,6 +359,7 @@ function handleWorkerMessage(ch, msg) {
       ch.openedAt = msg.openedAt || ch.openedAt;
       ch.lastActivityAt = msg.lastActivityAt || ch.lastActivityAt;
       ch.error = msg.error || null;
+      if (msg.errorKind) ch.errorKind = msg.errorKind;
       // Worker-driven state change: if it just left 'busy', reset busyAt
       // so the TUI's BUSY column collapses back to '-'.
       if (msg.state !== 'busy') ch.busyAt = null;
@@ -352,11 +392,24 @@ function handleWorkerMessage(ch, msg) {
     case 'log':
       log(`[${ch.id}] ${msg.level}: ${msg.message}`);
       break;
+
+    case 'token_validated':
+      // Worker saw a post-auth response (opened / unpaid / rate_limit_* /
+      // no_yield) for the first time — the token is proven good, regardless
+      // of whether the channel reaches READY.
+      markTokenValidated(typeof msg.tokenIdx === 'number' ? msg.tokenIdx : ch.tokenIdx);
+      break;
   }
 }
 
 function handleWorkerExit(ch, code, signal) {
-  log(`channel ${ch.id} (group=${ch.group}) exited code=${code} signal=${signal} state=${ch.state}`);
+  log(`channel ${ch.id} (group=${ch.group}) exited code=${code} signal=${signal} state=${ch.state}${ch.errorKind ? ` errorKind=${ch.errorKind}` : ''}${ch.error ? ` error="${String(ch.error).slice(0, 120)}"` : ''}`);
+  // Feed token health: an other_error death on a token that hasn't been
+  // validated counts as a strike. Once strikes >= TOKEN_DEATH_THRESHOLD,
+  // the token gets marked dead and skipped on future spawns.
+  if (ch.errorKind === 'other_error' && typeof ch.tokenIdx === 'number') {
+    recordTokenOtherError(ch.tokenIdx, ch.error);
+  }
   channels.delete(ch.id);
   const g = groups.get(ch.group);
   if (g) g.channels.delete(ch.id);
@@ -972,6 +1025,17 @@ function statusSnapshot() {
   });
   let configuredSize = 0;
   for (const g of groups.values()) configuredSize += g.targetSize;
+  const tokens = [];
+  for (let i = 0; i < _tokenCount; i++) {
+    tokens.push({
+      idx: i,
+      name: _tokenNames[i],
+      validated: _tokenValidated[i],
+      dead: _tokenDead[i],
+      otherErrorCount: _tokenOtherErrors[i],
+      lastError: _tokenLastError[i],
+    });
+  }
   return {
     type: 'status',
     pool: {
@@ -979,6 +1043,7 @@ function statusSnapshot() {
       actualSize: channels.size,
       channels: list,
       groups: groupsSnapshot(),
+      tokens,
       defaultGroup: POOL_MODEL,
       readyCount, busyCount, openingCount, deadCount,
       pendingRequests: requestQueue.length,
