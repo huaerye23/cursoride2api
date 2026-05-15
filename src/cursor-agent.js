@@ -802,59 +802,105 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
   return 'unknown';
 }
 
-// Handle an InteractionQuery from Cursor by replying with an
-// InteractionResponse that rejects the inner query. This is the path Cursor
-// uses for native tools that aren't part of ExecServerMessage:
-// WebSearch, WebFetch, ExaSearch, ExaFetch, AskQuestion, SwitchMode.
+// Handle an InteractionQuery from Cursor. This is the path Cursor uses for
+// native tools that aren't part of ExecServerMessage: WebSearch, ExaSearch,
+// ExaFetch, AskQuestion, SwitchMode (the InteractionQuery oneof; see the
+// vendored proto's `InteractionQuery.query` cases).
 //
 // Without a reply the model waits forever for our response and the whole
-// turn hangs. Rejecting forces the model to fall back to the MCP-prefixed
-// equivalent we registered (e.g. `mcp_WebSearch`), which we then bubble up
-// to the client as a normal tool_use.
-function handleInteractionQuery(iq, sendBinaryFrame) {
+// turn hangs. Two reply strategies, depending on the query and the
+// passthroughNativeTools flag:
+//
+//   1. APPROVE (webSearchRequestQuery, passthrough on) — Cursor's backend
+//      then performs the search server-side and streams results back via
+//      InteractionUpdate.tool_call_started/completed carrying a
+//      WebSearchToolCall. The model sees real results and continues; the
+//      user no longer gets a misleading "web access is blocked" message.
+//      WebSearchRequestResponse_Approved is an empty permission marker,
+//      not a result envelope — we cannot inject Claude Code's WebSearch
+//      output here; the search is fully server-side.
+//   2. REJECT (everything else, or webSearch with passthrough off) — the
+//      model is told the tool isn't available. Originally intended to make
+//      the model fall back to the registered `mcp_`-prefixed equivalent
+//      (e.g. mcp_WebSearch); in practice this fallback is unreliable and
+//      the model often surfaces the rejection text to the user.
+function handleInteractionQuery(iq, sendBinaryFrame, opts) {
   const { create, toBinary, agent } = _requireProto();
   const A = agent;
   const id = iq.id;
   const queryCase = iq.query?.case;
+  const passthroughNative = opts && opts.passthroughNativeTools === true;
   const REJECT_REASON = 'Tool not available; use MCP tools.';
 
   if (process.env.CURSOR_AGENT_DEBUG) {
     console.log(`[cursor-agent][debug] interactionQuery id=${id} case=${queryCase}`);
   }
 
-  // Build the rejected `result` payload for each query type. The inner
-  // shape varies — some have a flat oneof, others wrap it in a *Result.
+  // Trace decision so pre/post-fix runs leave matching evidence. Mirrors
+  // CURSOR_LOG_NATIVE_EXEC at handleExecMessage (line ~547).
+  function traceInteraction(action, extra) {
+    if (process.env.CURSOR_LOG_INTERACTION === '1') {
+      const idShort = typeof id === 'string' ? id.slice(0, 8) : id;
+      const x = extra ? ` ${extra}` : '';
+      console.log(`[cursor-agent] interactionQuery case=${queryCase} id=${idShort} passthrough=${passthroughNative} action=${action}${x}`);
+    }
+  }
+
+  // Build the result payload for each query type. The inner shape varies —
+  // some have a flat oneof, others wrap it in a *Result. Only WebSearch
+  // currently has an "approve" path; everything else rejects.
   let resultCase, resultValue;
   switch (queryCase) {
     case 'webSearchRequestQuery':
       resultCase = 'webSearchRequestResponse';
-      resultValue = create(A.WebSearchRequestResponseSchema, {
-        result: { case: 'rejected', value: create(A.WebSearchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
-      });
+      if (passthroughNative) {
+        // Approve — let Cursor's backend perform the search. Results stream
+        // back via interactionUpdate.tool_call_started/completed; no further
+        // action needed here.
+        const searchTerm = iq.query?.value?.args?.searchTerm || '';
+        resultValue = create(A.WebSearchRequestResponseSchema, {
+          result: { case: 'approved', value: create(A.WebSearchRequestResponse_ApprovedSchema, {}) },
+        });
+        traceInteraction('approve', `search_term="${searchTerm.slice(0, 60)}"`);
+      } else {
+        resultValue = create(A.WebSearchRequestResponseSchema, {
+          result: { case: 'rejected', value: create(A.WebSearchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+        });
+        traceInteraction('reject', `reason="${REJECT_REASON}"`);
+      }
       break;
     case 'webFetchRequestQuery':
+      // Note: WebFetchRequest* schemas are NOT in the vendored proto (grep
+      // src/proto/agent_pb.mjs returns no matches). The actual InteractionQuery
+      // oneof in the vendored proto doesn't include webFetchRequestQuery either
+      // (see descriptor probe), so this branch is unreachable — keeping it as
+      // a placeholder for a future proto regen.
       resultCase = 'webFetchRequestResponse';
       resultValue = create(A.WebFetchRequestResponseSchema, {
         result: { case: 'rejected', value: create(A.WebFetchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
       });
+      traceInteraction('reject');
       break;
     case 'exaSearchRequestQuery':
       resultCase = 'exaSearchRequestResponse';
       resultValue = create(A.ExaSearchRequestResponseSchema, {
         result: { case: 'rejected', value: create(A.ExaSearchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
       });
+      traceInteraction('reject');
       break;
     case 'exaFetchRequestQuery':
       resultCase = 'exaFetchRequestResponse';
       resultValue = create(A.ExaFetchRequestResponseSchema, {
         result: { case: 'rejected', value: create(A.ExaFetchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
       });
+      traceInteraction('reject');
       break;
     case 'switchModeRequestQuery':
       resultCase = 'switchModeRequestResponse';
       resultValue = create(A.SwitchModeRequestResponseSchema, {
         result: { case: 'rejected', value: create(A.SwitchModeRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
       });
+      traceInteraction('reject');
       break;
     case 'askQuestionInteractionQuery':
       // AskQuestionInteractionResponse wraps an AskQuestionResult oneof.
@@ -864,16 +910,18 @@ function handleInteractionQuery(iq, sendBinaryFrame) {
           result: { case: 'rejected', value: create(A.AskQuestionRejectedSchema, { reason: REJECT_REASON }) },
         }),
       });
+      traceInteraction('reject');
       break;
     default:
-      // Unknown / not in our vendored proto (e.g. webFetchRequestQuery,
-      // createPlanRequestQuery, setupVmEnvironmentArgs — proto field nums
-      // 7-9 added in newer Cursor releases). Send a bare InteractionResponse
-      // with just `id` set. Cursor's server treats an unset `result` oneof
-      // as "client abandoned this request"; the model then falls back to
-      // its MCP-prefixed equivalent (e.g. `mcp_WebFetch`) which we route
-      // back to the client like any other tool_use.
+      // Unknown / not in our vendored proto (e.g. createPlanRequestQuery,
+      // setupVmEnvironmentArgs — proto field nums 7-8 added in newer Cursor
+      // releases). Send a bare InteractionResponse with just `id` set.
+      // Cursor's server treats an unset `result` oneof as "client abandoned
+      // this request"; the model then falls back to its MCP-prefixed
+      // equivalent (e.g. `mcp_WebFetch`) which we route back to the client
+      // like any other tool_use.
       console.log(`[cursor-agent] interactionQuery case=${queryCase} id=${id} not handled in vendored proto; abandoning so model falls back to MCP`);
+      traceInteraction('abandon');
       resultCase = undefined;
       resultValue = undefined;
       break;
@@ -1546,7 +1594,9 @@ function startConversation(token, options = {}) {
     }
     if (msgCase === 'interactionQuery') {
       markUsefulFrame();
-      handleInteractionQuery(msg.message.value, sendBinaryFrame);
+      handleInteractionQuery(msg.message.value, sendBinaryFrame, {
+        passthroughNativeTools: !!options.passthroughNativeTools,
+      });
       return;
     }
     if (msgCase === 'execServerControlMessage') {

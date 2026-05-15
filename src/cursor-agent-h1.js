@@ -659,7 +659,9 @@ function startConversation(token, options = {}) {
     }
     if (msgCase === 'interactionQuery') {
       markUsefulFrame();
-      handleInteractionQuery(msg.message.value, sendBinaryFrame);
+      handleInteractionQuery(msg.message.value, sendBinaryFrame, {
+        passthroughNativeTools: !!options.passthroughNativeTools,
+      });
       return;
     }
     if (msgCase === 'execServerControlMessage') {
