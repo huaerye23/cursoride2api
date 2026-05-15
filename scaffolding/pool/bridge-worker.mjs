@@ -35,6 +35,21 @@ const MODEL = process.env.RATLC_MODEL || 'claude-opus-4-7-thinking-max-fast';
 // `last` mode (default) it's told each yield is the next user message
 // verbatim — the historical behavior.
 const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
+
+const TOKEN_PATH = new URL('../../token.json', import.meta.url);
+const tokenFile = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
+// Pool-manager round-robins across token.json's `tokens` array and passes
+// the assigned index via RATLC_TOKEN_INDEX. Defaults to 0 for backwards
+// compatibility (single-token deployments and direct-script use).
+const _tokenIdxRaw = parseInt(process.env.RATLC_TOKEN_INDEX || '0', 10);
+const _tokenIdx = Number.isFinite(_tokenIdxRaw)
+  && _tokenIdxRaw >= 0
+  && _tokenIdxRaw < tokenFile.tokens.length
+  ? _tokenIdxRaw
+  : 0;
+const token = tokenFile.tokens[_tokenIdx];
+const _tokenName = token?.name || `token-${_tokenIdx}`;
+
 const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '500', 10);
 const OPEN_RETRY_MS = parseInt(process.env.RATLC_OPEN_RETRY_MS || '300', 10);
 
@@ -62,16 +77,12 @@ const INITIAL_WAIT_MS = parseInt(process.env.RATLC_INITIAL_WAIT_MS || '1000', 10
 const _retryParamSummary = RETRY_MODE === 'constant'
   ? `interval=${CONSTANT_INTERVAL_MS}ms`
   : `floor=${WAIT_FLOOR_MS}ms ceiling=${WAIT_CEILING_MS}ms init=${INITIAL_WAIT_MS}ms decr=${WAIT_DECREASE_MS}ms incrx=${WAIT_INCREASE_FACTOR}`;
-console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL} ctxMode=${POOL_CONTEXT_MODE} retry=${RETRY_MODE}(${_retryParamSummary})`);
+console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRIDGE_PROTOCOL} ctxMode=${POOL_CONTEXT_MODE} retry=${RETRY_MODE}(${_retryParamSummary}) token[${_tokenIdx}]=${_tokenName}`);
 // When true, native Cursor tool calls (shellArgs/readArgs/writeArgs/...)
 // are translated to MCP-shape tool_use events under the matching
 // Anthropic name (Bash/Read/Write/...) instead of being rejected.
 // Enabled when the pool runs in POOL_TOOL_MODE=translate.
 const PASSTHROUGH_NATIVE = process.env.RATLC_PASSTHROUGH_NATIVE === '1';
-
-const TOKEN_PATH = new URL('../../token.json', import.meta.url);
-const tokenFile = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
-const token = tokenFile.tokens[0];
 
 const YIELD_TOOL_NAME = 'bajie_yield';
 

@@ -472,8 +472,8 @@ async function cmdTui() {
     if (pool.channels?.length) {
       // Channel table — sectioned by group when there's more than one group,
       // flat (today's behavior) when only one.
-      const w = [10, 10, 7, 8, 9, 8, 8, 7, 22];
-      const hdr = ['CHANNEL', 'STATE', 'BUSY', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
+      const w = [10, 10, 5, 7, 8, 9, 8, 8, 7, 22];
+      const hdr = ['CHANNEL', 'STATE', 'TOK', 'BUSY', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
 
       function emitRow(ch) {
         const c = STATE_COLOR[ch.state] || '';
@@ -490,13 +490,14 @@ async function cmdTui() {
         return [
           rpad(ch.id, w[0]),
           rpad(c + ch.state + ANSI.reset, w[1]),
-          rpad(busyTxt, w[2]),
-          rpad(String(ch.pid || '-'), w[3]),
-          rpad(String(ch.openAttempts || 0), w[4]),
-          rpad(fmtAgo(ch.openedAt), w[5]),
-          rpad(fmtAgo(ch.lastActivityAt), w[6]),
-          rpad(String(ch.roundsServed || 0), w[7]),
-          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[8]),
+          rpad(String(ch.tokenIdx ?? 0), w[2]),
+          rpad(busyTxt, w[3]),
+          rpad(String(ch.pid || '-'), w[4]),
+          rpad(String(ch.openAttempts || 0), w[5]),
+          rpad(fmtAgo(ch.openedAt), w[6]),
+          rpad(fmtAgo(ch.lastActivityAt), w[7]),
+          rpad(String(ch.roundsServed || 0), w[8]),
+          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[9]),
         ].join(' ');
       }
 

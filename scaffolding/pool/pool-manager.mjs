@@ -163,6 +163,32 @@ function parsePoolGroupsEnv() {
 let nextChannelSeq = 0;
 const channels = new Map();
 
+// ── Token rotation ───────────────────────────────────────────────────────
+// token.json is shaped { tokens: [{name, accessToken, machineId, macMachineId}, ...] }.
+// Round-robin assignment at spawn time: channel N gets tokens[N % count].
+// Spreads soft-rate-limit pressure across multiple accounts when more than
+// one token is present. With a single token in the file (the typical case)
+// every channel still uses tokens[0] — identical to the previous behavior.
+const _tokenPath = path.resolve(__dirname, '..', '..', 'token.json');
+let _tokenCount = 1;
+let _tokenNames = ['(default)'];
+try {
+  const _tokenFile = JSON.parse(fs.readFileSync(_tokenPath, 'utf8'));
+  if (Array.isArray(_tokenFile.tokens) && _tokenFile.tokens.length > 0) {
+    _tokenCount = _tokenFile.tokens.length;
+    _tokenNames = _tokenFile.tokens.map((t, i) => t.name || `token-${i}`);
+  }
+} catch (e) {
+  log(`WARN: failed to read ${_tokenPath} for rotation count: ${e.message} — assuming single token`);
+}
+log(`token rotation: ${_tokenCount} token(s) loaded — [${_tokenNames.join(', ')}]`);
+let _nextTokenIdx = 0;
+function nextTokenIndex() {
+  const idx = _nextTokenIdx % _tokenCount;
+  _nextTokenIdx = (_nextTokenIdx + 1) % _tokenCount;
+  return idx;
+}
+
 const requestQueue = [];
 const toolUseIndex = new Map();
 const requestClient = new Map();
@@ -213,10 +239,13 @@ function reopenAllChannels() {
 // ── Channel management ──────────────────────────────────────────────────
 function spawnChannel(group) {
   const channelId = `ch-${nextChannelSeq++}`;
+  const tokenIdx = nextTokenIndex();
+  const tokenName = _tokenNames[tokenIdx];
   const env = {
     ...process.env,
     RATLC_CHANNEL_ID: channelId,
     RATLC_MODEL: group.model,
+    RATLC_TOKEN_INDEX: String(tokenIdx),
     BRIDGE_PROTOCOL: POOL_BRIDGE_PROTOCOL,
     POOL_CONTEXT_MODE,
     POOL_REINJECT_THINKING: POOL_REINJECT_THINKING ? '1' : '0',
@@ -233,6 +262,8 @@ function spawnChannel(group) {
     proc,
     pid: proc.pid,
     group: group.model,
+    tokenIdx,
+    tokenName,
     state: 'spawning',
     openAttempts: 0,
     openedAt: 0,
@@ -257,7 +288,7 @@ function spawnChannel(group) {
   if (poolTools !== null) {
     proc.send({ type: 'open', model: group.model, tools: poolTools, system: poolSystem });
   }
-  log(`spawned ${channelId} (pid=${proc.pid}, group=${group.model}); pool size=${channels.size}`);
+  log(`spawned ${channelId} (pid=${proc.pid}, group=${group.model}, token[${tokenIdx}]=${tokenName}); pool size=${channels.size}`);
   return ch;
 }
 
@@ -916,6 +947,8 @@ function statusSnapshot() {
       id: ch.id,
       pid: ch.pid,
       group: ch.group,
+      tokenIdx: ch.tokenIdx ?? 0,
+      tokenName: ch.tokenName ?? '(default)',
       state: ch.state,
       openAttempts: ch.openAttempts,
       openedAt: ch.openedAt,
