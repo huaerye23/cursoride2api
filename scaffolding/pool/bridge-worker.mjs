@@ -411,8 +411,8 @@ async function handleMessage(msg) {
       return;
     }
     currentRequestId = msg.requestId;
-    setState('busy');
     lastActivityAt = Date.now();
+    setState('busy');
     console.log(`[bridge-worker ch=${CHANNEL_ID}] BEFORE bridge.sendToolResult(yield_id=${pendingYield.id?.slice?.(0,8)}, yield_execId=${pendingYield.execId?.slice?.(0,8)}, textBytes=${(msg.text||'').length}) bridgeExists=${!!bridge} fnType=${typeof bridge?.sendToolResult}`);
     try {
       bridge.sendToolResult(pendingYield.id, pendingYield.execId, msg.text || '');
@@ -439,8 +439,8 @@ async function handleMessage(msg) {
       return;
     }
     currentRequestId = msg.requestId;
-    setState('busy');
     lastActivityAt = Date.now();
+    setState('busy');
     bridge.sendToolResult(info.id, info.execId, msg.content || '');
     pendingMcpInfo.delete(msg.execId);
     return;
@@ -474,8 +474,8 @@ async function handleMessage(msg) {
       dispatchPlan.push({ info, content: r.content || '' });
     }
     currentRequestId = msg.requestId;
-    setState('busy');
     lastActivityAt = Date.now();
+    setState('busy');
     for (const { info, content } of dispatchPlan) {
       try {
         bridge.sendToolResult(info.id, info.execId, content);
@@ -498,8 +498,8 @@ async function handleMessage(msg) {
       return;
     }
     currentRequestId = msg.requestId;
-    setState('busy');
     lastActivityAt = Date.now();
+    setState('busy');
     bridge.sendToolResult(pendingYield.id, pendingYield.execId, '[health-check] Reply with exactly: OK');
     pendingYield = null;
     return;

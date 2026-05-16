@@ -370,7 +370,13 @@ function handleWorkerMessage(ch, msg) {
       ch.state = msg.state;
       ch.openAttempts = msg.openAttempts || ch.openAttempts;
       ch.openedAt = msg.openedAt || ch.openedAt;
-      ch.lastActivityAt = msg.lastActivityAt || ch.lastActivityAt;
+      // Defensive: lastActivityAt must only move forward. A stale IPC msg
+      // (e.g. setState called before lastActivityAt was bumped in the
+      // worker) could otherwise roll the clock back and trick the
+      // busy-watchdog into killing freshly-routed channels.
+      if (msg.lastActivityAt && msg.lastActivityAt > (ch.lastActivityAt || 0)) {
+        ch.lastActivityAt = msg.lastActivityAt;
+      }
       ch.error = msg.error || null;
       if (msg.errorKind) ch.errorKind = msg.errorKind;
       // Worker-driven state change: if it just left 'busy', reset busyAt
@@ -390,7 +396,9 @@ function handleWorkerMessage(ch, msg) {
       break;
 
     case 'heartbeat':
-      ch.lastActivityAt = msg.lastActivityAt || ch.lastActivityAt;
+      if (msg.lastActivityAt && msg.lastActivityAt > (ch.lastActivityAt || 0)) {
+        ch.lastActivityAt = msg.lastActivityAt;
+      }
       break;
 
     case 'text_delta':
