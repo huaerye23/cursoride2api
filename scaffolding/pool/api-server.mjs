@@ -162,6 +162,13 @@ function renderContentBlocks(blocks) {
       out.push(`<tool_result tool_use_id="${c.tool_use_id || ''}"${err}>\n${inner}\n</tool_result>`);
     } else if (c.type === 'image') {
       out.push('<image/>');
+    } else if (c.type === 'thinking' || c.type === 'redacted_thinking') {
+      // claude-code echoes thinking blocks back into messages on the next
+      // turn (interleaved-thinking beta). Render to text so the pool
+      // backend gets the human-readable form. Signature is dropped — we
+      // synthesized it, so Cursor wouldn't accept it anyway.
+      const t = typeof c.thinking === 'string' ? c.thinking : '';
+      if (t) out.push(`<thinking>\n${t}\n</thinking>`);
     } else if (typeof c.text === 'string') {
       // Tolerate untyped {text:"..."} entries (older SDKs).
       out.push(c.text);
@@ -272,6 +279,22 @@ async function handleMessagesRequest(req, res) {
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'bad json' } }));
   }
   const { messages, system, tools, model } = body;
+  // claude-code (and other clients) enable `interleaved-thinking-2025-05-14`
+  // beta plus `thinking: {type:'enabled'}` in the body when talking to
+  // thinking models. With that beta on, the client REQUIRES a `thinking`
+  // content block to precede any `tool_use` block in the assistant
+  // response. If we emit only the tool_use, claude-code rejects the
+  // whole stream with "API returned an empty or malformed response
+  // (HTTP 200)". We can't capture upstream signed thinking from Cursor
+  // (different signing keys), so we emit a placeholder thinking block
+  // with a synthetic signature whenever the request asked for thinking.
+  // Cursor's bidi stream doesn't verify Anthropic signatures, so the
+  // block round-tripping back into the next pool request as text is
+  // harmless. Pre-emit guard is on body.thinking.type, NOT the beta
+  // header — claude-code v2.1.143 sends both together, and the body
+  // field is the authoritative signal.
+  const clientThinkingEnabled =
+    body && body.thinking && (body.thinking.type === 'enabled' || body.thinking === 'enabled');
   if (process.env.LOG_REQUEST_TOOLS === '1') {
     log(`incoming /v1/messages: tools=${Array.isArray(tools) ? tools.length : 0} [${(tools || []).map((t) => t.name).slice(0, 30).join(', ')}]  system=${typeof system === 'string' ? system.length + 'c' : Array.isArray(system) ? 'array(' + system.length + ')' : 'none'}  model=${model || '(default)'}`);
   }
@@ -438,6 +461,9 @@ async function handleMessagesRequest(req, res) {
   }
 
   function startTextBlock() {
+    // Same ordering invariant as emitToolUseBlock — thinking block first
+    // when the client asked for thinking. See emitPlaceholderThinkingBlock.
+    emitPlaceholderThinkingBlock();
     blockIdx++;
     sseWrite(res, 'content_block_start', {
       type: 'content_block_start', index: blockIdx,
@@ -461,7 +487,43 @@ async function handleMessagesRequest(req, res) {
     textBlockOpen = false;
   }
 
+  // Whether we've emitted a placeholder thinking block already on this
+  // assistant turn. Anthropic emits at most one thinking block per
+  // assistant turn (before any tool_use); we mirror that.
+  let placeholderThinkingEmitted = false;
+  function emitPlaceholderThinkingBlock() {
+    if (placeholderThinkingEmitted) return;
+    if (!clientThinkingEnabled) return;
+    stopTextBlock();
+    blockIdx++;
+    sseWrite(res, 'content_block_start', {
+      type: 'content_block_start', index: blockIdx,
+      content_block: { type: 'thinking', thinking: '' },
+    });
+    // Single short thinking_delta with placeholder text so the block has
+    // content. The text doesn't need to mean anything to the client; it
+    // just satisfies the parser's "thinking block must exist" requirement.
+    sseWrite(res, 'content_block_delta', {
+      type: 'content_block_delta', index: blockIdx,
+      delta: { type: 'thinking_delta', thinking: '(thinking captured upstream; not forwarded by proxy)' },
+    });
+    // Signature delta: claude-code stores this and may echo it back on
+    // the next request. Cursor's bidi stream doesn't verify Anthropic
+    // signatures, so a synthetic value is safe end-to-end. Use a
+    // base64-looking string of plausible length.
+    sseWrite(res, 'content_block_delta', {
+      type: 'content_block_delta', index: blockIdx,
+      delta: { type: 'signature_delta', signature: 'proxy-placeholder-signature-' + messageId },
+    });
+    sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIdx });
+    placeholderThinkingEmitted = true;
+  }
+
   function emitToolUseBlock(anthropicId, toolName, args) {
+    // claude-code with interleaved-thinking beta REQUIRES a thinking
+    // block before any tool_use block, otherwise it rejects the whole
+    // SSE as "empty or malformed". Emit a placeholder once per turn.
+    emitPlaceholderThinkingBlock();
     stopTextBlock();
     blockIdx++;
     sseWrite(res, 'content_block_start', {
