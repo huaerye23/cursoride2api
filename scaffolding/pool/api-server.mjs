@@ -360,6 +360,13 @@ async function handleMessagesRequest(req, res) {
   let stopReason = 'end_turn';
   let done = false;
   let toolUseEmitted = false;
+  // `messageStarted` gates startMsg() so it can only fire once per request.
+  // Was previously gated on `blockIdx === -1`, but startMsg doesn't bump
+  // blockIdx — so the route_decision branch AND the error branch would
+  // both call startMsg(), emitting two `message_start` SSE events. That
+  // shape is malformed enough that claude-code rejects the response with
+  // "API returned an empty or malformed response (HTTP 200)".
+  let messageStarted = false;
   // Parallel-tool-calls fix: after each tool_use, arm a *watchdog* timer.
   //
   // In theory the primary finalize signal during a tool_use turn is
@@ -408,6 +415,8 @@ async function handleMessagesRequest(req, res) {
   }
 
   function startMsg() {
+    if (messageStarted) return;
+    messageStarted = true;
     writeHeadersOnce();
     sseWrite(res, 'message_start', {
       type: 'message_start',
