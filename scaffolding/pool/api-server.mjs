@@ -1103,6 +1103,61 @@ function handleRenderDebug(req, res) {
   })();
 }
 
+// ── POST /v1/messages/count_tokens (Anthropic Messages API) ────────────
+//
+// claude-code's `/context` command and Anthropic SDK fit-check paths
+// POST here to ask "how many input tokens would this body cost?" Without
+// the endpoint claude-code 404s and falls back to a rougher client-side
+// char-count estimator. Anthropic's real endpoint returns
+//   { "input_tokens": <int> }
+// We approximate via character-count heuristic at ~3.5 chars/token (a
+// decent estimate for English code/text on the Claude tokenizer). Good
+// enough for fit checks; not for billing. Ported from the legacy
+// server.js on `feat/anthropic-api-support` (lines 1478–1545 there).
+function countCharsRecursive(value) {
+  if (value == null) return 0;
+  if (typeof value === 'string') return value.length;
+  if (typeof value === 'number') return String(value).length;
+  if (Array.isArray(value)) {
+    let n = 0;
+    for (const item of value) n += countCharsRecursive(item);
+    return n;
+  }
+  if (typeof value === 'object') {
+    let n = 0;
+    for (const k of Object.keys(value)) {
+      n += k.length; // count field-name overhead too
+      n += countCharsRecursive(value[k]);
+    }
+    return n;
+  }
+  return 0;
+}
+
+async function handleCountTokens(req, res) {
+  let body;
+  try { body = await readJsonBody(req); }
+  catch (e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'bad json' } }));
+  }
+  const { messages, system, tools } = body || {};
+  if (!Array.isArray(messages)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'messages is required' } }));
+  }
+  let chars = 0;
+  if (system != null) chars += countCharsRecursive(system);
+  chars += countCharsRecursive(messages);
+  if (Array.isArray(tools)) chars += countCharsRecursive(tools);
+  // Round up so we never under-report (under-reporting risks claude-code
+  // thinking a fork fits when it actually doesn't).
+  const inputTokens = Math.ceil(chars / 3.5);
+  log(`  count_tokens: messages=${messages.length} tools=${Array.isArray(tools) ? tools.length : 0} system=${system != null} chars=${chars} → ${inputTokens} tokens`);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ input_tokens: inputTokens }));
+}
+
 function handleHealth(req, res) {
   // Open a one-shot socket to the pool — keeps administrative requests
   // off the main streaming socket.
@@ -1142,6 +1197,7 @@ const server = http.createServer(async (req, res) => {
   const path = (req.url || '').split('?')[0];
   log(`${req.method} ${req.url}`);
   if (req.method === 'POST' && path === '/v1/messages') return handleMessagesRequest(req, res);
+  if (req.method === 'POST' && path === '/v1/messages/count_tokens') return handleCountTokens(req, res);
   if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return handleModels(req, res);
   if (req.method === 'GET' && path === '/health') return handleHealth(req, res);
   if (req.method === 'GET' && path === '/metrics') return handleMetrics(req, res);
