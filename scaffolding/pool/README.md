@@ -67,6 +67,32 @@ the children + api-server).
 | `CURSOR_LOG_NATIVE_EXEC` | `1` | unset | Log every native exec passthrough event |
 | `LOG_REQUEST_TOOLS` | `1` | unset | api-server logs incoming tool list per request |
 | `LOG_REQUEST_BODY` | n/a | n/a | Body summary (last-message role + content shape) is always on. |
+| `CURSOR_LOG_INTERACTION` | `1` | unset | Log every `interactionQuery` decision (WebSearch approve/reject) and backend `webSearchToolCall` byte counts |
+
+### Retry / watchdog tuning
+
+| Var | Values | Default | What it controls |
+|---|---|---|---|
+| `RATLC_RETRY_MODE` | `constant` \| `aimd` | `constant` | How a bridge-worker paces channel-open retries. `constant` fires every `RATLC_CONSTANT_INTERVAL_MS` regardless of response — fastest in practice. `aimd` is TCP-style adaptive (multiplicative back-off on rate-limit, additive ramp on success) — useful for sustained-pressure scenarios. |
+| `RATLC_CONSTANT_INTERVAL_MS` | int | `500` | Fixed retry interval in `constant` mode |
+| `RATLC_WAIT_FLOOR_MS` | int | `300` | AIMD floor (most aggressive wait) |
+| `RATLC_WAIT_CEILING_MS` | int | `30000` | AIMD ceiling (slowest wait) |
+| `RATLC_WAIT_DECREASE_MS` | int | `50` | AIMD linear decrement per non-rate-limit |
+| `RATLC_WAIT_INCREASE_FACTOR` | float | `2.0` | AIMD multiplier per rate-limit hit |
+| `RATLC_INITIAL_WAIT_MS` | int | `1000` | AIMD starting wait |
+| `RATLC_OPEN_RETRY_MAX` | int | `500` | Hard cap on open attempts per worker before process recycle |
+| `POOL_TOOL_USE_WATCHDOG_MS` | int | `1000` | Tool-use turn finalize watchdog. Re-armed on every `text_delta` / `thinking_delta` / `tool_use`, so it measures "model went silent" rather than "no more tool_uses." See [STEP_COMPLETED_INVESTIGATION.md](./STEP_COMPLETED_INVESTIGATION.md) and [WATCHDOG_REARM_REVIEW.md](./WATCHDOG_REARM_REVIEW.md) for why this design. |
+| `POOL_TOOL_USE_DEBOUNCE_MS` | int | unset | Legacy alias for `POOL_TOOL_USE_WATCHDOG_MS`; kept for backwards compat |
+| `RATLC_BUSY_STUCK_TIMEOUT_MS` | int | `240000` | Pool-manager scans for channels stuck in `busy` state with no activity longer than this and SIGTERMs the worker. Replacement spawns automatically. The ultimate safety net beyond the tool-use watchdog. |
+
+### Multi-token (per-account) configuration
+
+| Var | Default | What it controls |
+|---|---|---|
+| `RATLC_TOKEN_DEATH_THRESHOLD` | `3` | Consecutive `other_error` strikes (with no token validation) before pool-manager marks a token dead and skips it in round-robin. `auth_error` and `quota_exhausted` always mark dead on first strike regardless of this. |
+| `CURSOR_CLIENT_OS` | auto-detected | Forces the `x-cursor-client-os` header. Auto-derives `darwin` when `token.macMachineId` is set and host isn't darwin (Mac-minted token spoofing). Override here to force a value. |
+| `CURSOR_CLIENT_OS_VERSION` | `os.release()` or `23.5.0` for Mac-spoof | Forces `x-cursor-client-os-version` header. |
+| `CURSOR_CLIENT_ARCH` | `process.arch` or `arm64` for Mac-spoof | Forces `x-cursor-client-arch` header. |
 
 ## Multi-group model pools
 
@@ -178,12 +204,95 @@ ratlc claude --model claude-4.6-sonnet-medium-fast
 ### Constraints
 
 - The default group is always `POOL_MODEL` and cannot be removed.
-- All groups share `token.json` (same Cursor account, same quota).
-  Per-group token partitioning is out of scope for v1.
+- All groups share `token.json` (channels distribute across tokens via
+  round-robin — see [§ Multi-account token rotation](#multi-account-token-rotation)).
 - Channel ids stay globally monotonic (`ch-0`, `ch-1`, ...) regardless
   of group ownership. `ratlc restart ch-N` works the same.
 - `POOL_TOOL_MODE` / `POOL_CONTEXT_MODE` / `POOL_REINJECT_THINKING`
   apply pool-wide (no per-group overrides in v1).
+
+## Multi-account token rotation
+
+`token.json` holds an array of accounts. Each new channel spawn gets a
+token via round-robin (`channelSeq % tokenCount`). With N accounts, soft-
+rate-limit pressure that Cursor applies per-account is distributed
+across all N — typically 2-3× sustained throughput vs a single account.
+
+### token.json shape
+
+```jsonc
+{
+  "tokens": [
+    {
+      "name": "account-1",              // human label; appears in logs
+      "accessToken": "...",             // Cursor bearer token
+      "machineId": "...",               // 64-hex from Cursor IDE install
+      "macMachineId": "..."             // 128-hex; presence triggers Mac-OS spoofing on non-Mac hosts
+    },
+    {
+      "name": "account-2",
+      "accessToken": "...",
+      "machineId": "...",
+      "macMachineId": "..."
+    }
+  ]
+}
+```
+
+Single-token deployments work unchanged (every channel gets index 0).
+With N > 1, the pool boot log says `token rotation: N token(s) loaded —
+[name1, name2, ...]` and each spawn log line includes
+`token[idx]=name`.
+
+### Token health detection
+
+Bad tokens are detected automatically via the response-kind classifier
+in `bridge-worker.mjs onError`. Three definite-fatal kinds:
+
+| Kind | Pattern | When marked dead |
+|---|---|---|
+| `auth_error` | `ERROR_NOT_LOGGED_IN`, `unauthenticated` | First strike |
+| `quota_exhausted` | `ERROR_RATE_LIMITED_CHANGEABLE`, `API usage limit reached` | First strike |
+| `other_error` | Anything we don't classify | After `RATLC_TOKEN_DEATH_THRESHOLD` strikes (default 3), only if the token has never reached a post-auth response |
+
+A token is marked **validated** the first time it gets any of: `opened`,
+`unpaid`, `rate_limit_soft`, `rate_limit_hard`, `no_yield` — these all
+prove the token authenticated past Cursor's gate. Validated tokens are
+exempt from `other_error` strikes (treated as transients).
+
+Dead tokens are skipped in `nextTokenIndex` round-robin. They never get
+new channels until pool restart. To revive: fix the underlying account
+(re-login, refill quota), `ratlc down`, `ratlc up`.
+
+### Observing token health
+
+```bash
+ratlc tui
+# new TOK column on the channel table shows token index per channel
+# new "token health" panel below the group table (only with N > 1 tokens)
+# shows IDX / NAME / VALIDATED / DEAD / OTHERERR / LAST_ERROR per token
+
+ratlc metrics
+# JSON snapshot now includes `pool.tokens[]` with full per-token state
+```
+
+The pool log emits clear events for every transition:
+- `token rotation: N token(s) loaded — [name1, name2, ...]`
+- `spawned ch-K (..., token[idx]=name)`
+- `token[idx]=name validated (reached Cursor past auth)`
+- `⚠ TOKEN DEAD (auth_error): token[idx]=name marked dead on first strike. ...`
+- `⚠ TOKEN DEAD: token[idx]=name marked dead after N consecutive other_error failures ...`
+
+### Constraints
+
+- All tokens share the same set of model groups. Per-token model
+  affinity isn't in v1.
+- Each token's machine fingerprint (machineId / macMachineId) is used
+  individually for header generation — the per-token
+  `resolveClientFingerprint(token)` correctly handles a mix of Mac-
+  minted and Linux-minted tokens.
+- Adding a token requires pool restart to pick up. Hot-reload of
+  `token.json` is out of scope for v1.
 
 ## Context modes (`full` vs `last`)
 
@@ -299,7 +408,7 @@ node scaffolding/pool/parallel-tools-test.mjs
 
 All three should PASS in the recommended config (`h1 + translate + full`).
 
-## What works (current state, 2026-05-14)
+## What works (current state, 2026-05-15)
 
 - ✅ **HTTP/1.1 transport** via `BidiAppend` + `RunSSE` pair. Bypasses
   the per-account rate-limit ceiling that capped H2 at ~2-3 channels.
@@ -332,6 +441,41 @@ All three should PASS in the recommended config (`h1 + translate + full`).
   without falling back to "X unavailable" hallucinations or Bash
   heredocs. Round-trip validated by `tool-coverage-test.mjs` and
   `live-claude-sim-test.mjs` against a real pool.
+- ✅ **Multi-account token rotation** — `token.json` accepts an array
+  of accounts; pool-manager round-robins token assignment per spawn.
+  Spreads soft-rate-limit pressure across N accounts. See
+  [§ Multi-account token rotation](#multi-account-token-rotation).
+- ✅ **Token health detection** — bad tokens (invalid auth or
+  account-quota-exhausted) are flagged on first strike via the
+  response-kind classifier; dead tokens are skipped in rotation.
+  Validated tokens (those that reached any post-auth response) are
+  exempt from `other_error` strikes. TUI shows full per-token state.
+- ✅ **Header fingerprint auto-detection** — Mac-minted tokens running
+  from a non-Mac host now automatically claim macOS in headers
+  (matching the checksum bundle). Was a hard-rate-limit pitfall pre-`d65a0cb`.
+- ✅ **Busy-watchdog** — pool-manager kills channels stuck in `busy`
+  state with no activity longer than `RATLC_BUSY_STUCK_TIMEOUT_MS`
+  (default 240 s). Last-resort safety net beyond the tool-use
+  watchdog and HTTP-layer stall detection.
+- ✅ **tool_use watchdog re-arms on every model delta** — finalize
+  timer measures "model went silent" not "no more tool_uses"; works
+  correctly even on `*-thinking-fast` Cursor variants that don't
+  emit `step_completed`. See [STEP_COMPLETED_INVESTIGATION.md](./STEP_COMPLETED_INVESTIGATION.md).
+- ✅ **WebSearch Write-spoof rejected** — model emitting empty `Write`
+  to `agent-tools/<uuid>.txt` (the cheap-confabulation pattern) gets
+  a synthetic `tool_error` instead of a silent success. See
+  [AGENT_TOOLS_SPOOF_OBSERVATION.md](./AGENT_TOOLS_SPOOF_OBSERVATION.md).
+- ✅ **WebFetch passthrough no longer pre-summarizes** — hardcoded
+  `"Summarize this content."` prompt replaced with a neutral
+  "return content as-is" instruction so models doing structured
+  extraction get raw text.
+- ✅ **AIMD self-tuning retry** — `RATLC_RETRY_MODE=aimd` available
+  for high-throttle scenarios. Default `constant` 500 ms is fastest
+  in typical use.
+- ✅ **NIAH context measured** — `claude-opus-4-7-max-fast` reliably
+  retrieves at all positions up through 600 k tokens; falls off a
+  cliff at 650-700 k. See [NIAH_RESULTS.md](./NIAH_RESULTS.md) — the
+  test script is committed and re-runnable.
 
 See `H1_RESULTS.md` for the scale-test results (10 channels @ H1: 0
 hard rate-limit hits vs 108 on H2). See `TOOL_USE_HANG_FINDINGS.md`
@@ -444,6 +588,8 @@ STATE     spawning     forked, not yet started open
           ready        parked in bajie_yield, awaiting request
           busy         serving a request OR holding a tool_use
           dead         fatal error, will be respawned
+TOK                    index into token.json's tokens[] for this channel
+BUSY                   time in current turn (yellow >180 s, red >240 s)
 PID                    OS pid of the worker process
 ATTEMPTS               how many retry attempts the lottery has taken
 AGE                    time since the channel opened (first lottery win)
@@ -453,14 +599,31 @@ CURRENT                request id currently in flight on this channel
 ERROR                  most recent error message (if any)
 ```
 
+Token-health panel (only shown when more than one token in token.json):
+
+```
+IDX                    token index
+NAME                   token's `name` field from token.json
+VALIDATED              ✓ if the token has reached any post-auth response
+DEAD                   YES if pool-manager has marked dead; skipped in rotation
+OTHERERR               count of unclassified `other_error` strikes
+LAST_ERROR             the actual Cursor error message (colored)
+```
+
 ## Common diagnostic paths
 
 | Symptom | Where to look |
 |---|---|
 | claude-code hangs mid-conversation | `/tmp/ratlc-api.log` for "→ tool_use to client" then check `/tmp/ratlc-pool.log` for the matching `sendToolResult` and `BidiAppend OK seqno=…` |
 | "API returned an empty or malformed response" | Likely parallel-tool-call bug if the model fires multiple in one turn. We support this now; if it surfaces, check `pendingMcpInfo` map state |
-| Channel stuck `opening` forever | Probabilistic gate or hard rate-limit — log entries `stream-summary-h1 code=fail reason="…"` reveal which |
-| Channel stuck `busy` with high `IDLE` | The bridge sent a tool result but Cursor's model isn't resuming. Likely the `streamClose` issue if pre-`72c60fd`, otherwise check the receive-side msgCase trace |
+| Channel stuck `opening` forever | Probabilistic gate or hard rate-limit — `stream-summary-h1 code=fail reason="…"` entries reveal which. If reason is `unauthenticated` or `API usage limit reached`, see [§ Token health detection](#token-health-detection) — the token will get marked dead on first strike. |
+| Channel stuck `busy` with high `IDLE` | Pool-manager's busy-watchdog will SIGTERM it at `RATLC_BUSY_STUCK_TIMEOUT_MS` (default 240 s). If you're seeing this routinely, check [WATCHDOG_REARM_REVIEW.md](./WATCHDOG_REARM_REVIEW.md) — the tool_use watchdog might be finalizing turns prematurely (re-armed in `3c2f017` to mitigate). |
+| Pool slowly shrinks: token count drops, no new spawns | A token has been marked dead (see [§ Multi-account token rotation](#multi-account-token-rotation)). `ratlc tui` → token-health panel shows which, and the `LAST_ERROR` column shows why. Fix the upstream account, then `ratlc down` + `ratlc up`. |
+| Model returns "READY" instead of answering a long-context question | You're above the model's effective context window. See [NIAH_RESULTS.md](./NIAH_RESULTS.md) — `claude-opus-4-7-max-fast` tops out around 600 k tokens (Cursor truncates from the tail, leaving only the priming "Reply with READY" instruction). |
+| Model writes empty files to `agent-tools/<uuid>.txt` then narrates fake WebSearch results | Known model confabulation pattern. The proxy now rejects these Writes (`3c2f017`); see [AGENT_TOOLS_SPOOF_OBSERVATION.md](./AGENT_TOOLS_SPOOF_OBSERVATION.md) for diagnosis. |
+| Linux pool gets 100% rate-limit even on first attempt | Mac-minted `token.json` + Linux host. `d65a0cb` auto-detects this via `token.macMachineId` and claims `darwin` headers. If you've overridden `CURSOR_CLIENT_OS=linux` for some reason, unset it. |
 
-See `TOOL_USE_HANG_FINDINGS.md`, `H1_RESULTS.md`, and `FOCUS.md` for the
-underlying RE work.
+See `TOOL_USE_HANG_FINDINGS.md`, `H1_RESULTS.md`, `FOCUS.md`,
+`STEP_COMPLETED_INVESTIGATION.md`, `NIAH_RESULTS.md`, and the
+`WEBSEARCH_WEBFETCH_REVIEW.md` / `WATCHDOG_REARM_REVIEW.md` /
+`AGENT_TOOLS_SPOOF_OBSERVATION.md` review docs for underlying details.

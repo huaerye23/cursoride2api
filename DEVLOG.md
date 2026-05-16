@@ -1601,6 +1601,143 @@ compatible: single-value `POOL_MODEL=opus` still works unchanged.
 Covered by `scaffolding/pool/csv-pool-model-test.mjs` (8 steps,
 mock-channel based, no Cursor quota).
 
+### Pool resilience overhaul (2026-05-14/15) — multi-day session
+
+A pair of extended sessions reshaped the pool's failure-handling
+layer end-to-end. The driving observation: a single bad cursor token
+(or a single misbehaving model variant) could silently shrink pool
+capacity or hang individual channels indefinitely, with no automated
+recovery. Themes, roughly in dependency order:
+
+**1. Header fingerprint auto-detection** (commit `d65a0cb`). ratlc on
+a non-Mac host with a Mac-minted `token.json` was hitting 100% soft
+rate-limit on every `RunSSE` open. Cursor's anti-abuse gate rejects
+the bundle when `x-cursor-client-os: linux` is paired with checksum
+inputs (`machineId` + `macMachineId`) that were minted on macOS. The
+new `resolveClientFingerprint(token)` in `cursor-agent.js` claims
+`darwin` / `arm64` / `23.5.0` when `token.macMachineId` is truthy and
+`process.platform !== 'darwin'` — same effect as setting
+`CURSOR_CLIENT_OS=darwin` manually, but automatic.
+
+**2. Live ATTEMPTS column** (commit `05970c6`). The bridge-worker only
+sent state updates every 10 retries, so the TUI's `ATTEMPTS` column
+appeared stuck at 1 for minutes at a time. Now pushes state on every
+attempt — IPC cost is ~15 msg/s in the worst case, well below the
+socket's headroom.
+
+**3. Retry-mode switch** (commit `f0d6a78`). What started as
+"unconditional 300ms retry" (commit `09a918c`, since superseded)
+evolved into a `RATLC_RETRY_MODE=constant|aimd` switch. Constant mode
+(default 500 ms) is empirically fastest in practice; AIMD mode is
+kept available for high-throttle scenarios where adaptive back-off
+would help.
+
+**4. tool_use watchdog redesign** (commits `cd34ecf`, `2a004f2`,
+`3c2f017`). The 250 ms "debounce backstop" was acting as the de-facto
+primary finalize signal — and the `*-thinking-fast` Cursor variants
+turned out to never emit `interactionUpdate.stepCompleted` at all
+(0 events across many turns). Rolling chronology of fixes:
+
+- **First attempt** (`cd34ecf`): bumped the watchdog to 30s under the
+  (wrong) assumption that `step_completed` was the primary signal.
+  Made every tool-use turn wait 30s — visibly broken.
+- **Empirical correction** (`2a004f2`): dropped to 1s after observing
+  the actual data. Adequate for typical observed gaps (150-480 ms
+  intra-step), but vulnerable to re-arm gap.
+- **Re-arm hardening** (`3c2f017`): watchdog now re-armed on every
+  `text_delta` / `thinking_delta` / `tool_use`. Measures "model went
+  silent" not "no more tool_uses." Eliminates the orphan-tool_use bug
+  where a long thinking gap mid-step would finalize the turn and
+  drop subsequent tool_uses on the floor.
+
+See `STEP_COMPLETED_INVESTIGATION.md` for the empirical case for why
+this had to be redesigned, and `WATCHDOG_REARM_REVIEW.md` for the
+re-arm gap analysis.
+
+**5. Busy-watchdog as ultimate safety net** (commit `d1c5eee`). Pool-
+manager scans every 30 s for channels stuck in `busy` state with no
+activity for `RATLC_BUSY_STUCK_TIMEOUT_MS` (default 240 s). Kills the
+worker; replacement spawns automatically. Catches the residual cases
+where the tool-use watchdog AND `step_completed` AND `yield` all miss
+(IPC hang, deadlock, etc.).
+
+**6. Multi-token support** (commit `8df0b6f`). `token.json`'s `tokens`
+array was already in the data shape but only `tokens[0]` was read.
+Pool-manager now round-robins token assignment across spawns
+(`RATLC_TOKEN_INDEX` injected per-fork). Spreads soft-rate-limit
+pressure across multiple Cursor accounts when more than one is
+configured.
+
+**7. Token health detection** (commits `45129f3`, `5c6ae7d`). The
+classifier in `bridge-worker.mjs onError` now distinguishes:
+- `auth_error` (`ERROR_NOT_LOGGED_IN`, `unauthenticated`) — invalid
+  token; mark dead on first strike.
+- `quota_exhausted` (`ERROR_RATE_LIMITED_CHANGEABLE`,
+  `API usage limit reached`) — account quota hit; mark dead on first
+  strike.
+- `other_error` (catch-all) — keep 3-strike threshold for transients.
+
+A token reaching ANY non-other_error response (including unpaid /
+rate_limit_* / no_yield — all post-auth signals) gets marked
+`validated`, which excludes it from the dead-on-strike heuristic.
+Dead tokens are skipped in `nextTokenIndex` round-robin. TUI's new
+`token-health` panel surfaces `validated`/`dead`/`OTHERERR`/
+`LAST_ERROR` per account.
+
+**8. WebSearch / WebFetch hardening** (commit `3c2f017`). Three review
+docs identified ~9 issues across both paths; the high-impact ones
+landed:
+
+- `Write` spoof rejection: model emitting an empty `Write` to
+  `agent-tools/<uuid>.txt` (counterfeiting a WebSearch result) is now
+  short-circuited with a `[proxy_error]` tool_result. Detailed
+  diagnosis in `AGENT_TOOLS_SPOOF_OBSERVATION.md`.
+- WebFetch passthrough no longer hardcodes
+  `"Summarize this content."` (proto introspection confirmed there's
+  no model-supplied prompt field upstream).
+- Dead `webFetchRequestQuery` reject branch removed; falls through to
+  abandon — same end-state as WebSearch pre-`f6cc478`.
+- Backend `webSearchToolCall` completions logged with byte count when
+  `CURSOR_LOG_INTERACTION=1`.
+
+**9. NIAH context-window probe** (commit `a45b41a`). 24-call needle-in-
+haystack run against `claude-opus-4-7-max-fast` revealed an effective
+context window of ~600 k tokens, far below the model's nominal 1M.
+Above 650 k, the model returns the literal `"READY"` priming string
+instead of answering (Cursor's `max-fast` variant truncates from the
+tail, leaving only the priming context). Reproducible via the
+committed `niah-test.mjs`; full results in `NIAH_RESULTS.md`.
+
+**New env vars introduced this session:**
+
+| Var | Default | What |
+|---|---|---|
+| `RATLC_RETRY_MODE` | `constant` | `constant` (fixed) \| `aimd` (TCP-style adaptive) |
+| `RATLC_CONSTANT_INTERVAL_MS` | `500` | Fixed retry interval in constant mode |
+| `RATLC_WAIT_FLOOR_MS` | `300` | AIMD: most aggressive wait |
+| `RATLC_WAIT_CEILING_MS` | `30000` | AIMD: slowest wait |
+| `RATLC_WAIT_DECREASE_MS` | `50` | AIMD: linear decrement on non-rate-limit |
+| `RATLC_WAIT_INCREASE_FACTOR` | `2.0` | AIMD: multiplier on rate-limit |
+| `RATLC_INITIAL_WAIT_MS` | `1000` | AIMD: starting wait |
+| `POOL_TOOL_USE_WATCHDOG_MS` | `1000` | tool_use finalize watchdog. Re-armed on every model delta. Old `POOL_TOOL_USE_DEBOUNCE_MS` kept as fallback. |
+| `RATLC_BUSY_STUCK_TIMEOUT_MS` | `240000` | Pool-manager busy-watchdog kills channels stuck busy longer |
+| `RATLC_TOKEN_DEATH_THRESHOLD` | `3` | Strike count before marking a token dead on `other_error` |
+| `RATLC_OPEN_RETRY_MAX` | `500` | Worker retry cap before process recycle (was here pre-session, documented) |
+| `CURSOR_LOG_INTERACTION` | unset | Log every `interactionQuery` / `webSearchToolCall` decision |
+
+**New TUI columns / panels:**
+- `TOK` — token index per channel
+- `BUSY` — time in current turn, yellow >180 s, red >240 s
+- Token health panel — validated / dead / errs / lastError (only with
+  multiple tokens)
+
+**Findings docs committed alongside:**
+- `AGENT_TOOLS_SPOOF_OBSERVATION.md` — Write-spoof reproducer
+- `WEBSEARCH_WEBFETCH_REVIEW.md` — 9-issue review
+- `WATCHDOG_REARM_REVIEW.md` — watchdog re-arm gap analysis
+- `STEP_COMPLETED_INVESTIGATION.md` — why we work around missing signal
+- `NIAH_RESULTS.md` — effective context measurement
+
 ---
 
 ## Future work / open issues
