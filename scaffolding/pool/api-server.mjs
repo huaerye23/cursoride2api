@@ -773,10 +773,21 @@ async function handleMessagesRequest(req, res) {
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
         finishMessage();
       } else if (msg.type === 'error') {
+        // Anthropic's real SSE for errors emits ONLY `event: error` and
+        // closes the stream. NO message_delta + message_stop afterwards.
+        // claude-code's parser treats an SSE that contains an `error`
+        // event followed by message_delta/message_stop as malformed and
+        // surfaces a second "API returned an empty or malformed response
+        // (HTTP 200)" error on top of the original error message. So we
+        // emit the error event, close the stream, and skip finishMessage.
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
-        if (blockIdx === -1) startMsg();
+        startMsg(); // idempotent now via the messageStarted guard
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
-        finishMessage();
+        done = true;
+        disarmToolUseFinalizer();
+        if (POOL_REINJECT_THINKING) thinkingBuffer.commitTurn(convKey);
+        try { res.end(); } catch { /* ignore */ }
+        reqHandlers.delete(requestId);
       }
     },
   });
