@@ -11,6 +11,13 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
 import * as thinkingBuffer from './thinking-buffer.mjs';
+import {
+  performWebSearch,
+  extractQuery,
+  formatSearchResults,
+  fallbackNoticeBody,
+  resultsLookGeneric,
+} from './spoof-mitigation.mjs';
 
 // Bridge to the existing CommonJS anthropic-tools helpers so we can reuse
 // `deriveConversationKey` and `extractClientSessionId` instead of porting
@@ -53,6 +60,54 @@ let poolSock = null;
 let poolBuf = '';
 const reqHandlers = new Map();      // requestId -> { onEvent }
 let reconnectTimer = null;
+
+// Spoof-mitigation playbook: when the model emits the empty Write→
+// agent-tools/<uuid>.txt pattern, we kick off a real Bing RSS search
+// asynchronously and record the resulting PROMISE keyed by tool_use_id.
+// When claude-code POSTs the corresponding tool_result back, we
+// `await` the promise (with timeout) and REPLACE the short "File
+// created at..." ack with the real search payload before forwarding
+// to the pool. The model sees actual web data inline in its next
+// assistant turn — without needing to re-read the file.
+//
+// The tool_use forwarding is NOT blocked by the search: we mutate
+// msg.args.content to a static proxy_notice (so claude-code's Write
+// succeeds with non-empty content) and let the SSE flow proceed. The
+// search runs in parallel; by the time claude-code's Write finishes
+// (~10ms) and POSTs the tool_result, the search (~200ms) is usually
+// still in flight — we await it briefly there.
+//
+// Earlier attempt (commit 0867440 → reverted 88f7c70) failed because
+// of duplicate `message_start` SSE events and missing interleaved-
+// thinking blocks on the route_decision error path. Both fixed in
+// commits 9485e8e and 65310a6, so the playbook is safe to re-enable.
+//
+// Bounded FIFO with SPOOF_PLAYBOOK_MAX entries — prevents unbounded
+// growth on long-running api-server processes.
+const SPOOF_PLAYBOOK_MAX = 256;
+const SPOOF_SEARCH_WAIT_MS = 5000;
+const spoofResultPlaybook = new Map();
+function recordSpoofResult(toolUseId, promise) {
+  if (!toolUseId || !promise) return;
+  if (spoofResultPlaybook.size >= SPOOF_PLAYBOOK_MAX) {
+    const firstKey = spoofResultPlaybook.keys().next().value;
+    if (firstKey !== undefined) spoofResultPlaybook.delete(firstKey);
+  }
+  spoofResultPlaybook.set(toolUseId, promise);
+}
+async function consumeSpoofResult(toolUseId) {
+  const p = spoofResultPlaybook.get(toolUseId);
+  if (p === undefined) return undefined;
+  spoofResultPlaybook.delete(toolUseId);
+  try {
+    return await Promise.race([
+      p,
+      new Promise((resolve) => setTimeout(() => resolve(null), SPOOF_SEARCH_WAIT_MS)),
+    ]);
+  } catch {
+    return null;
+  }
+}
 
 function connectPool() {
   poolSock = net.createConnection(POOL_SOCK);
@@ -713,6 +768,38 @@ async function handleMessagesRequest(req, res) {
             // non-empty. claude-code writes the notice to the file and
             // returns its standard success result.
             msg.args = { ...msg.args, content: noticeBody };
+            // ALSO kick off a real Bing RSS search in parallel and
+            // record the promise keyed by the tool_use_id. When
+            // claude-code POSTs the tool_result back (~10ms later for
+            // a local Write), the send_tool_results path will await
+            // the search briefly and REPLACE the "File created" ack
+            // with the real search results before forwarding to the
+            // pool. The model then sees actual web data in its next
+            // assistant turn. See spoofResultPlaybook above.
+            //
+            // Tool_use id we record under: emitToolUseBlock sends
+            // msg.anthropic_id to the client, and claude-code echoes
+            // it back as tool_result.tool_use_id. Cover both ids in
+            // case a translation step preserves msg.id instead.
+            const query = extractQuery(messages);
+            log(`  ↪ spoof: launching async search query="${query.slice(0, 120).replace(/\n/g, ' ')}" toolUseId=${msg.anthropic_id}`);
+            const searchPromise = (async () => {
+              try {
+                if (!query) throw new Error('no extractable query');
+                const results = await performWebSearch(query, { timeoutMs: 4500, maxResults: 5 });
+                if (resultsLookGeneric(results)) {
+                  throw new Error(`results look generic (top hosts: ${results.slice(0, 3).map((r) => { try { return new URL(r.url).hostname; } catch { return '?'; } }).join(', ')})`);
+                }
+                const body = formatSearchResults(query, results, { fetchedAtIso: new Date().toISOString() });
+                log(`  ↪ spoof: search OK, ${results.length} results (${body.length}B) toolUseId=${msg.anthropic_id}`);
+                return body;
+              } catch (err) {
+                log(`  ↪ spoof: search failed (${err.message || err}) toolUseId=${msg.anthropic_id} — will fall back to proxy_notice in tool_result`);
+                return null;
+              }
+            })();
+            recordSpoofResult(msg.anthropic_id, searchPromise);
+            if (msg.id && msg.id !== msg.anthropic_id) recordSpoofResult(msg.id, searchPromise);
             // Intentionally fall through to the standard translate /
             // contract forwarding logic — DO NOT return early.
           }
@@ -799,14 +886,30 @@ async function handleMessagesRequest(req, res) {
     // must resolve to the same channel — the manager defensively checks
     // this and errors out if not (which shouldn't happen by construction,
     // since they were all emitted by one channel in one assistant turn).
-    log(`  → pool send_tool_results requestId=${requestId} count=${toolResults.length} ids=[${toolResults.map(r => r.tool_use_id).join(', ')}]`);
+    //
+    // Spoof-mitigation injection: for any tool_use_id we recorded in the
+    // playbook (because the model emitted the Write-spoof pattern and
+    // we kicked off an async Bing search), await the search briefly and
+    // REPLACE the tool_result content with the real search payload.
+    // claude-code wrote a real file with proxy_notice but the model
+    // doesn't necessarily read the file back — putting results inline
+    // in the tool_result is the reliable channel.
+    const enriched = await Promise.all(toolResults.map(async (r) => {
+      const injected = await consumeSpoofResult(r.tool_use_id);
+      if (injected) {
+        log(`  ↪ spoof-result injection: tool_use_id=${r.tool_use_id} replacing ${r.text ? r.text.length + 'B ack' : 'empty ack'} with ${injected.length}B search payload`);
+        return { anthropic_tool_use_id: r.tool_use_id, content: injected };
+      }
+      // Either no playbook entry (normal tool_result) or search failed/
+      // timed out — forward whatever claude-code's Write actually
+      // returned (the proxy_notice ack).
+      return { anthropic_tool_use_id: r.tool_use_id, content: r.text };
+    }));
+    log(`  → pool send_tool_results requestId=${requestId} count=${enriched.length} ids=[${enriched.map(r => r.anthropic_tool_use_id).join(', ')}]`);
     poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
       model: model || null,
-      results: toolResults.map((r) => ({
-        anthropic_tool_use_id: r.tool_use_id,
-        content: r.text,
-      })),
+      results: enriched,
     });
   } else {
     // Mode selection: in `full` mode, render the ENTIRE messages[] into

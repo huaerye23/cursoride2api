@@ -934,6 +934,56 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
       // equivalent (e.g. `mcp_WebFetch`) which we route back to the client
       // like any other tool_use.
       console.log(`[cursor-agent] interactionQuery case=${queryCase} id=${id} not handled in vendored proto; abandoning so model falls back to MCP`);
+      // Diagnostic: dump the raw bytes of the unknown InteractionQuery so
+      // we can identify which new oneof case Cursor is sending. The first
+      // varint after the `id` field tag carries the unknown field's
+      // (number, wire_type). Decode by hand or extend the proto.
+      try {
+        const bytes = toBinary(A.InteractionQuerySchema, iq);
+        const hex = Buffer.from(bytes).toString('hex');
+        console.log(`[cursor-agent][unknown-iq] id=${id} bytes(${bytes.length})=${hex}`);
+        // Scan for tags at the top level. Each tag is a varint where
+        // (tag >> 3) is the field_number and (tag & 7) is the wire_type.
+        // Skip known fields and report the rest.
+        let off = 0;
+        const tags = [];
+        while (off < bytes.length) {
+          let tag = 0, shift = 0, b;
+          do {
+            if (off >= bytes.length) break;
+            b = bytes[off++];
+            tag |= (b & 0x7f) << shift;
+            shift += 7;
+          } while (b & 0x80);
+          const fieldNum = tag >>> 3;
+          const wireType = tag & 7;
+          tags.push({ fieldNum, wireType, atOffset: off - 1 });
+          // Skip payload to reach next tag.
+          if (wireType === 0) {
+            // varint
+            while (off < bytes.length && (bytes[off++] & 0x80)) { /* keep going */ }
+          } else if (wireType === 2) {
+            // length-delimited: read length varint, skip that many bytes
+            let len = 0, lshift = 0;
+            do {
+              if (off >= bytes.length) break;
+              b = bytes[off++];
+              len |= (b & 0x7f) << lshift;
+              lshift += 7;
+            } while (b & 0x80);
+            off += len;
+          } else if (wireType === 1) {
+            off += 8;
+          } else if (wireType === 5) {
+            off += 4;
+          } else {
+            break;
+          }
+        }
+        console.log(`[cursor-agent][unknown-iq] tags=${JSON.stringify(tags)}`);
+      } catch (dumpErr) {
+        console.log(`[cursor-agent][unknown-iq] dump-failed: ${dumpErr.message}`);
+      }
       traceInteraction('abandon');
       resultCase = undefined;
       resultValue = undefined;
