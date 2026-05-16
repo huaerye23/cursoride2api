@@ -677,7 +677,42 @@ async function handleMessagesRequest(req, res) {
         if (POOL_REINJECT_THINKING) thinkingBuffer.append(convKey, msg.text || '');
         if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'tool_use') {
-        if (done) return;
+        if (done) {
+          // Orphaned-tool_use race: the watchdog already fired and finished
+          // this message, but a tool_use IPC arrived from the pool AFTER
+          // done=true. This happens when the model emits parallel
+          // tool_uses on Cursor's side with >1s gaps between them — the
+          // watchdog (default 1 s) finalizes the turn before the later
+          // tool_uses reach us. claude-code already saw message_stop and
+          // can never POST a tool_result for this one, but the channel's
+          // bridge-worker still has the execId in pendingMcpInfo. Without
+          // intervention the channel sits busy until the 240 s
+          // busy-watchdog reap.
+          //
+          // Send a synthetic [proxy_error] tool_result via the pool so
+          // the bridge unblocks. This is SAFE in this specific scenario
+          // (unlike the Write-spoof synthetic-result attempts in
+          // 3c2f017/4984888) because:
+          //   1. The model on Cursor's side EMITTED this tool_use itself
+          //      and is genuinely waiting for any tool_result.
+          //   2. We send the SAME shape it would get from a real
+          //      claude-code failure — error content with a clear message.
+          //   3. We never claimed success / pretended a side-effect ran.
+          // The model is free to retry, give up, or pick a different
+          // approach on its next turn.
+          log(`⚠ orphaned tool_use after watchdog finalize: name=${msg.name} anthropic_id=${msg.anthropic_id} reqId=${requestId} — sending synthetic error result to unblock channel`);
+          poolWrite({
+            type: 'request',
+            requestId: requestId + ':orphan_unblock_' + (msg.anthropic_id || 'unknown').slice(-8),
+            action: 'send_tool_results',
+            model: model || null,
+            results: [{
+              anthropic_tool_use_id: msg.anthropic_id,
+              content: '[proxy_error] tool_use orphaned by api-server watchdog (model emitted multiple tool_uses with >1s gap between them; the watchdog finalized the turn before this one reached the client). Retry as a single call or in tighter sequence.',
+            }],
+          });
+          return;
+        }
         // Parallel-tool-calls fix: emit the tool_use block but DO NOT finish
         // the message here. The model may emit several tool_uses in a single
         // assistant turn — each must get its own content_block_start with a
