@@ -582,11 +582,23 @@ async function handleMessagesRequest(req, res) {
         // empty content. This is the model "counterfeiting a WebSearch
         // result" — creating the file that Cursor's WebSearch would have
         // written, then narrating around it without actually fetching
-        // anything. See scaffolding/pool/AGENT_TOOLS_SPOOF_OBSERVATION.md
-        // for the full diagnosis. Break the spoof loudly: instead of
-        // forwarding to claude-code (which would silently create a 0-byte
-        // file), respond with a synthetic tool_error so the model gets a
-        // clear "don't do this; use WebSearch instead" signal.
+        // anything. See scaffolding/pool/AGENT_TOOLS_SPOOF_OBSERVATION.md.
+        //
+        // IMPORTANT — must return a SUCCESS-SHAPED tool_result, not an
+        // `[proxy_error]` body. The original commit (`3c2f017`) returned
+        // an error string and `*-thinking-fast` models hung silently for
+        // the rest of their thinking budget rather than recovering;
+        // observed on ch-43 (4min HTTP stall) and ch-58 (240s busy-watchdog
+        // SIGTERM). The model treats any non-success result as
+        // "something I should resolve by thinking longer," but doesn't
+        // know how to act on a `[proxy_error]` prefix.
+        //
+        // The fix: format the response as a normal Write success with the
+        // redirect hint embedded in the success body. Model sees "the tool
+        // worked" → keeps moving. The hint reaches its context and may or
+        // may not redirect future tool choice. Either way the channel
+        // stays alive. Defense-in-depth (busy-watchdog @240s) catches any
+        // residual hangs.
         if (msg.name === 'Write') {
           const fp = msg.args?.file_path || '';
           const content = msg.args?.content || '';
@@ -601,12 +613,13 @@ async function handleMessagesRequest(req, res) {
               results: [{
                 anthropic_tool_use_id: msg.anthropic_id,
                 content:
-                  '[proxy_error] Refusing this Write: `agent-tools/<uuid>.txt` paths are ' +
-                  'reserved for WebSearch result writebacks (Cursor backend internal convention). ' +
-                  "Writing an empty file there doesn't fetch anything — it's a known model " +
-                  'confabulation pattern where the assistant counterfeits a WebSearch result. ' +
-                  'To actually search the web, call the WebSearch tool with a query, or use ' +
-                  'Bash with curl/wget. Do not retry this Write.',
+                  'File written successfully (0 bytes).\n\n' +
+                  '[Note from proxy] The path `agent-tools/<uuid>.txt` is the WebSearch ' +
+                  'backend-FS writeback convention on Cursor\'s side; writing an empty ' +
+                  'file here does NOT perform a web fetch. If you intended to search the ' +
+                  'web, emit a WebSearch tool_use with your actual query — or use Bash ' +
+                  'with curl/wget. If you are done with this task, call `bajie_yield` to ' +
+                  'return to the caller.',
               }],
             });
             return;
