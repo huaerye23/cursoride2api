@@ -1740,6 +1740,46 @@ committed `niah-test.mjs`; full results in `NIAH_RESULTS.md`.
 
 ---
 
+## 2026-05-15 (later): Write-spoof — real web search injection
+
+The earlier "rewrite-and-forward" mitigation (commit `523bbcf`) kept channels healthy but didn't fix model confabulation — the file got our `proxy_notice` text written into it, then the model went on to invent search results anyway because it doesn't reliably read the file back before generating its final answer.
+
+This session added a second-layer mitigation: when the proxy detects the spoof pattern, it asynchronously fetches real search results and routes them through BOTH the Write payload and the corresponding tool_result content.
+
+**Implementation (`scaffolding/pool/spoof-mitigation.mjs` + api-server.mjs):**
+
+1. `extractQuery(messages)` — walks user-role messages backward, skips `<system-reminder>` blocks injected by claude-code, strips natural-language preambles ("search online and tell me", "look up", etc.) and leading stop-words. Returns a single query string suitable for a search engine.
+2. `performWebSearch(query)` — Bing RSS endpoint (`bing.com/search?q=...&format=rss`). DDG HTML was tried first but returns the anomaly modal (HTTP 202, no results) on every request from Linux server IPs. Bing RSS works without an API key, returns clean XML, and gives us title/link/description per item.
+3. `resultsLookGeneric(results)` — quality gate. If >50% of result hosts match `google.com / bing.com / yahoo.com / duckduckgo.com / merriam-webster.com / dictionary.com / ...`, the batch is treated as a miss and the caller falls back to the previous proxy_notice text. Avoids feeding the model dictionary entries / search-engine homepages and triggering confabulation around irrelevant snippets.
+
+**api-server.mjs wiring:**
+
+- `dispatchEvent(msg)` extracted from the inline `onEvent` body so the spoof-handler can synchronously suspend dispatch while the async fetch is in flight. `eventQueue` holds events that arrive during the fetch (other tool_uses, step_completed, yield) and replays them in order after the spoof resolves. Without this queue, a step_completed arriving mid-fetch would finalize the message before the spoof tool_use reached claude-code, orphaning the tool_use_id.
+- `spoofResultPlaybook` — bounded FIFO Map (256 entries) keyed by tool_use_id → injected body. Populated when the spoof handler resolves; consumed in the `send_tool_results` forwarding path. The model's tool_result content gets the real search results in place of claude-code's 175-byte "File created at..." ack.
+
+**Why both layers:** The Write rewrite alone left the model in a Write→Write loop across turns — it doesn't read the file back before generating the next assistant turn, so the injected content was invisible to it. Putting the same content in the tool_result body is the reliable channel because the model already incorporates tool_result content into context.
+
+**Why not a synthetic tool_result (skipping claude-code entirely):** Tried twice previously (`3c2f017`, `4984888`). Both killed channels — the model emits a tool_use it expects to come back through claude-code's executor; a proxy-synthesized tool_result without a corresponding claude-code POST leaves the busy-watchdog to reap the channel at 240 s. Never reintroduce that path.
+
+**Verified live (2026-05-15):**
+
+Test query `"search online: lmarena leaderboard - tell me the top 3 ranked LLMs"` against `claude-opus-4-7-thinking-max-fast`. Pool log shows:
+
+```
+⚠ Write-spoof intercept: empty Write→agent-tools/8f672c8f-...txt req=req-76719a276d5a403a; fetching real search results, query="lmarena leaderboard - tell me the top 3 ranked LLMs"
+✓ Write-spoof rewrite: injected 5 search results (1907B) req=req-76719a276d5a403a
+↪ spoof-result injection: tool_use_id=toolu_d6dd357051e04917 replacing 175B ack with 1907B search payload
+```
+
+Model produced a coherent answer citing `lmarena.ai/de/leaderboard/` — a real URL from the Bing results. Pre-mitigation, the model invented both the source and the rankings. ELO numbers in the response are still fabricated because Bing's snippets don't carry numeric leaderboard data; the fallback notice's "use Bash `curl <URL>`" guidance is the next-step mitigation for that, and the model gets the curl-able URL from the real results.
+
+**Limitations:**
+
+- Bing's relevance is finicky. Queries that start with stop-words ("the top 3...") return generic dictionary entries; queries that lead with the distinctive noun ("lmarena leaderboard") return the right pages. The `extractQuery` heuristic helps but doesn't normalize all phrasings.
+- Snippet-only data: the model can cite real URLs but still invents specifics that aren't in the snippet body. To get authoritative numbers it would need to actually follow up with a `curl`. The proxy_notice fallback explicitly tells it to do so.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).

@@ -88,3 +88,60 @@ Top 4 are statistically tied (overlapping CIs). Calling any single model "SOTA" 
 - `/root/Dropbox/common_codes_streamed/monolithicv/agent-tools/*.txt` -- the empty spoof files (9 of them, all 0 bytes, all written by me during this session and the one before it).
 - `WEBSEARCH_WEBFETCH_REVIEW.md` -- prior review that motivated this observation; Issue 2 is the relevant one.
 - `WATCHDOG_REARM_REVIEW.md` -- sibling review covering a separate finalize-timing issue.
+
+## Current mitigation (2026-05-15, implemented this branch)
+
+Implemented in `scaffolding/pool/spoof-mitigation.mjs` + the `tool_use` /
+`send_tool_results` handlers in `scaffolding/pool/api-server.mjs`.
+
+Two-layer rewrite, both fired off the same trigger:
+
+**Trigger:** model emits `Write` with `file_path` matching
+`agent-tools/<uuid-v4>.txt` AND `content` empty/whitespace.
+
+**Layer 1 — Write payload rewrite (file gets useful contents):**
+1. Pull the user's actual search intent out of `req.body.messages`
+   (`extractQuery`, strips claude-code's `<system-reminder>` blocks and
+   "search online -" preamble).
+2. Run a real Bing RSS search (`https://www.bing.com/search?q=...&format=rss`).
+   DuckDuckGo HTML was tried first but anomaly-modals every request
+   from Linux server IPs; Bing RSS works without an API key.
+3. If results pass a generic-host quality gate (`resultsLookGeneric`),
+   format them into a numbered list with title / URL / snippet per
+   item and replace `msg.args.content` in flight.
+4. Otherwise fall back to a `proxy_notice` body that tells the model
+   the path is a Cursor backend convention and to emit WebSearch / Bash
+   `curl` instead.
+
+The rewritten tool_use forwards normally to claude-code, which performs
+a real `Write` with the injected content. Channel stays healthy
+because the tool_use shape is unchanged.
+
+**Layer 2 — tool_result injection (model sees results in-context):**
+
+Recorded the tool_use_id → injected body in a small bounded Map
+(`spoofResultPlaybook`). When claude-code POSTs the corresponding
+tool_result back, the proxy replaces claude-code's short "File created
+at..." ack with the search-result body before forwarding to the pool.
+The model receives the search results inline in its next assistant
+turn's context, instead of having to re-read the file.
+
+Without Layer 2 the model stayed in a Write→Write loop across all
+turns (it doesn't read the file back before generating the next
+turn). With Layer 2 the model produces a final answer and cites a
+real URL pulled from the injected results, though it can still
+hallucinate specific numbers when Bing snippets don't carry them —
+the fallback notice's "use Bash `curl`" guidance is the next-step
+mitigation for that.
+
+**Operational characteristics:**
+
+- DDG-style synthetic `tool_result` rejection (without going through
+  claude-code) consistently killed channels in prior attempts
+  (`3c2f017`, `4984888`); never reintroduce that path.
+- Events that arrive during the async fetch (other tool_uses,
+  `step_completed`, `yield`) queue in `eventQueue` and replay in
+  order after the fetch resolves. Avoids orphaning subsequent
+  tool_uses in the same step.
+- Playbook is FIFO-capped at 256 entries — bounded growth across
+  long-running api-server processes.
