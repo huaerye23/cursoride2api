@@ -577,54 +577,28 @@ async function handleMessagesRequest(req, res) {
         // back to the inner agent by sending a tool_error result via
         // the pool socket — the agent picks a different approach.
 
-        // Spoof rejection: model emits Write with file_path matching the
-        // WebSearch backend-FS sentinel (`agent-tools/<uuid>.txt`) and
-        // empty content. This is the model "counterfeiting a WebSearch
-        // result" — creating the file that Cursor's WebSearch would have
-        // written, then narrating around it without actually fetching
-        // anything. See scaffolding/pool/AGENT_TOOLS_SPOOF_OBSERVATION.md.
+        // Note: there was a Write-spoof rejection here (commits 3c2f017
+        // and 4984888) that intercepted empty Write to
+        // `agent-tools/<uuid>.txt` — the model's known counterfeit-
+        // WebSearch pattern. BOTH shapes were tried live and BOTH caused
+        // *-thinking-fast model variants to hang silently after receiving
+        // the rejection: ch-43 (4 min HTTP stall), ch-58 (269 s busy-
+        // watchdog SIGTERM), ch-84 (130s silence and counting at the
+        // time of revert). The model's downstream plan after emitting
+        // the Write is structurally tied to expecting that file to
+        // exist with content; any tool_result that deviates from "the
+        // file we just wrote is real and has content" stalls it.
         //
-        // IMPORTANT — must return a SUCCESS-SHAPED tool_result, not an
-        // `[proxy_error]` body. The original commit (`3c2f017`) returned
-        // an error string and `*-thinking-fast` models hung silently for
-        // the rest of their thinking budget rather than recovering;
-        // observed on ch-43 (4min HTTP stall) and ch-58 (240s busy-watchdog
-        // SIGTERM). The model treats any non-success result as
-        // "something I should resolve by thinking longer," but doesn't
-        // know how to act on a `[proxy_error]` prefix.
+        // Decision: don't intercept. Let claude-code handle the Write
+        // (creates 0-byte file), let the model proceed with its
+        // confabulation pattern. Channels stay alive. Quality of model
+        // output degrades for that turn — the model narrates fake
+        // content from a real-but-empty file — but the model-side fix
+        // is not in this proxy's reach.
         //
-        // The fix: format the response as a normal Write success with the
-        // redirect hint embedded in the success body. Model sees "the tool
-        // worked" → keeps moving. The hint reaches its context and may or
-        // may not redirect future tool choice. Either way the channel
-        // stays alive. Defense-in-depth (busy-watchdog @240s) catches any
-        // residual hangs.
-        if (msg.name === 'Write') {
-          const fp = msg.args?.file_path || '';
-          const content = msg.args?.content || '';
-          const uuidV4Path = /^agent-tools\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$/i;
-          if (uuidV4Path.test(fp) && String(content).trim() === '') {
-            log(`⚠ rejecting Write spoof: empty Write to ${fp} (WebSearch sentinel-spoof pattern) requestId=${requestId}`);
-            poolWrite({
-              type: 'request',
-              requestId: requestId + ':spoof_reject',
-              action: 'send_tool_results',
-              model: model || null,
-              results: [{
-                anthropic_tool_use_id: msg.anthropic_id,
-                content:
-                  'File written successfully (0 bytes).\n\n' +
-                  '[Note from proxy] The path `agent-tools/<uuid>.txt` is the WebSearch ' +
-                  'backend-FS writeback convention on Cursor\'s side; writing an empty ' +
-                  'file here does NOT perform a web fetch. If you intended to search the ' +
-                  'web, emit a WebSearch tool_use with your actual query — or use Bash ' +
-                  'with curl/wget. If you are done with this task, call `bajie_yield` to ' +
-                  'return to the caller.',
-              }],
-            });
-            return;
-          }
-        }
+        // See AGENT_TOOLS_SPOOF_OBSERVATION.md for the diagnosis of the
+        // spoof pattern itself, and the discussion in DEVLOG.md for why
+        // we backed out the intercept.
 
         if (POOL_TOOL_MODE === 'translate' && !isInternalTool(msg.name)) {
           const xlated = cursorToAnthropic(msg.name, msg.args || {});
