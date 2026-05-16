@@ -11,13 +11,6 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
 import * as thinkingBuffer from './thinking-buffer.mjs';
-import {
-  performWebSearch,
-  extractQuery,
-  formatSearchResults,
-  fallbackNoticeBody,
-  resultsLookGeneric,
-} from './spoof-mitigation.mjs';
 
 // Bridge to the existing CommonJS anthropic-tools helpers so we can reuse
 // `deriveConversationKey` and `extractClientSessionId` instead of porting
@@ -60,30 +53,6 @@ let poolSock = null;
 let poolBuf = '';
 const reqHandlers = new Map();      // requestId -> { onEvent }
 let reconnectTimer = null;
-
-// Spoof-mitigation playbook: maps a rewritten Write tool_use_id to the
-// search-results body the proxy injected. When claude-code POSTs the
-// tool_result for that tool_use back in the next request, we replace
-// the short "File created at..." ack with the search results so the
-// pool-side model sees the real data INLINE in its tool_result (the
-// model doesn't necessarily re-read the file, so an in-context payload
-// is the only reliable way to break the spoof-then-confabulate loop).
-// Bounded to SPOOF_PLAYBOOK_MAX entries with FIFO eviction.
-const SPOOF_PLAYBOOK_MAX = 256;
-const spoofResultPlaybook = new Map();
-function recordSpoofResult(toolUseId, body) {
-  if (!toolUseId || !body) return;
-  if (spoofResultPlaybook.size >= SPOOF_PLAYBOOK_MAX) {
-    const firstKey = spoofResultPlaybook.keys().next().value;
-    if (firstKey !== undefined) spoofResultPlaybook.delete(firstKey);
-  }
-  spoofResultPlaybook.set(toolUseId, body);
-}
-function consumeSpoofResult(toolUseId) {
-  const v = spoofResultPlaybook.get(toolUseId);
-  if (v !== undefined) spoofResultPlaybook.delete(toolUseId);
-  return v;
-}
 
 function connectPool() {
   poolSock = net.createConnection(POOL_SOCK);
@@ -539,20 +508,8 @@ async function handleMessagesRequest(req, res) {
   // socket error), the error handler below will call writeHeadersOnce()
   // with no x-ratlc-* fields and then startMsg() + finishMessage().
 
-  // Event queue guard for async spoof mitigation. When the model emits
-  // the Write-spoof pattern we hold all subsequent events until the
-  // proxy-side DuckDuckGo search resolves, then replay them in order.
-  // The model is gated on the tool_result for THIS request anyway, so
-  // delaying tool_use forwarding by a few hundred ms is invisible to
-  // anyone except the proxy log. step_completed / yield events that
-  // arrive during the fetch MUST also be delayed — otherwise we'd
-  // finalize the message before the spoof tool_use reaches claude-code
-  // and the tool_use_id would never get a tool_result. See
-  // spoof-mitigation.mjs and AGENT_TOOLS_SPOOF_OBSERVATION.md.
-  let spoofPending = false;
-  const eventQueue = [];
-
-  const dispatchEvent = (msg) => {
+  reqHandlers.set(requestId, {
+    onEvent: (msg) => {
       if (msg.type === 'route_decision') {
         routedTo = msg.servedModel || null;
         routedChannel = msg.channelId || null;
@@ -656,60 +613,37 @@ async function handleMessagesRequest(req, res) {
         //
         // See AGENT_TOOLS_SPOOF_OBSERVATION.md for the spoof pattern
         // diagnosis and DEVLOG.md for the iteration history.
-        if (msg.name === 'Write' && !msg.__spoofResolved) {
+        if (msg.name === 'Write') {
           const fp = msg.args?.file_path || '';
           const content = msg.args?.content || '';
           const uuidV4Path = /^agent-tools\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$/i;
           if (uuidV4Path.test(fp) && String(content).trim() === '') {
-            // Real-search rewrite: hold the tool_use, hit DuckDuckGo on
-            // behalf of the model, inject the actual results into the
-            // Write content, then resume the normal forwarding path.
-            // While the fetch is in flight, all subsequent pool events
-            // queue (see the outer spoofPending guard). The model is
-            // already gated on the tool_result for this request so the
-            // delay is invisible from the client side. If the search
-            // fails, we fall back to the same proxy_notice text the
-            // previous (sync) mitigation injected.
-            spoofPending = true;
-            const query = extractQuery(messages);
-            log(`⚠ Write-spoof intercept: empty Write→${fp} req=${requestId}; fetching real search results, query="${query.slice(0, 120).replace(/\n/g, ' ')}"`);
-            (async () => {
-              let injectedBody;
-              try {
-                if (!query) throw new Error('no extractable query');
-                const results = await performWebSearch(query, { timeoutMs: 12000, maxResults: 5 });
-                if (resultsLookGeneric(results)) {
-                  throw new Error(`results look generic (top hosts: ${results.slice(0, 3).map((r) => { try { return new URL(r.url).hostname; } catch { return '?'; } }).join(', ')})`);
-                }
-                injectedBody = formatSearchResults(query, results, { fetchedAtIso: new Date().toISOString() });
-                msg.args = { ...msg.args, content: injectedBody };
-                log(`✓ Write-spoof rewrite: injected ${results.length} search results (${injectedBody.length}B) req=${requestId}`);
-              } catch (err) {
-                injectedBody = fallbackNoticeBody(err.message || String(err));
-                msg.args = { ...msg.args, content: injectedBody };
-                log(`⚠ Write-spoof rewrite: search failed (${err.message || err}) — fallback notice (${injectedBody.length}B) req=${requestId}`);
-              }
-              // Record under both Anthropic and Cursor tool_use ids — the
-              // SSE we emit to the client uses `msg.anthropic_id`, but
-              // some translation paths preserve `msg.id`. Whichever id
-              // comes back on the tool_result is what we'll match on.
-              recordSpoofResult(msg.anthropic_id, injectedBody);
-              recordSpoofResult(msg.id, injectedBody);
-              msg.__spoofResolved = true;
-              // Re-dispatch THIS message (mutated) through the inner
-              // dispatcher — NOT through onEvent, which would re-queue.
-              // Then drain anything that arrived during the fetch.
-              try {
-                dispatchEvent(msg);
-              } finally {
-                spoofPending = false;
-                while (eventQueue.length > 0) {
-                  const next = eventQueue.shift();
-                  dispatchEvent(next);
-                }
-              }
-            })();
-            return; // suspend processing this tool_use until fetch resolves
+            const noticeBody =
+              '[proxy_notice — read this carefully]\n\n' +
+              'This file was created by a CLIENT-SIDE Write tool call, not by a real ' +
+              'web fetch. The path `agent-tools/<uuid>.txt` is the convention Cursor\'s ' +
+              'backend uses to write WebSearch results to disk on its OWN filesystem — ' +
+              'when you (the model) emit Write to this path, you are NOT triggering a ' +
+              'web fetch, you are just creating an empty file locally and getting a ' +
+              'success response.\n\n' +
+              'This is a known confabulation pattern. If you proceed to narrate web ' +
+              'content as if you had fetched it, you will be fabricating facts.\n\n' +
+              'WHAT TO DO INSTEAD:\n' +
+              '  - To search the web: emit a WebSearch tool_use with a `search_term`.\n' +
+              '  - To fetch a specific URL: emit a Bash tool_use with `curl -sL <url>`.\n' +
+              '  - If you cannot fulfill the user request without web access, tell the ' +
+              'user that and call `bajie_yield`.\n\n' +
+              'DO NOT quote this proxy_notice as if it were search results. DO NOT ' +
+              'fabricate web content.';
+            log(`⚠ Write-spoof intercept: rewriting empty Write→${fp} content with proxy_notice (${noticeBody.length}B) requestId=${requestId}`);
+            // Mutate the args in place so the normal forwarding path
+            // below picks up the new content. The shape stays identical
+            // to a regular Write — file_path unchanged, content now
+            // non-empty. claude-code writes the notice to the file and
+            // returns its standard success result.
+            msg.args = { ...msg.args, content: noticeBody };
+            // Intentionally fall through to the standard translate /
+            // contract forwarding logic — DO NOT return early.
           }
         }
 
@@ -773,12 +707,6 @@ async function handleMessagesRequest(req, res) {
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
         finishMessage();
       }
-  };
-
-  reqHandlers.set(requestId, {
-    onEvent: (msg) => {
-      if (spoofPending) { eventQueue.push(msg); return; }
-      dispatchEvent(msg);
     },
   });
 
@@ -789,27 +717,14 @@ async function handleMessagesRequest(req, res) {
     // must resolve to the same channel — the manager defensively checks
     // this and errors out if not (which shouldn't happen by construction,
     // since they were all emitted by one channel in one assistant turn).
-    //
-    // Spoof-mitigation injection: any tool_use_id we recorded in the
-    // playbook (because the model emitted the Write-spoof pattern and
-    // the proxy already fetched real search results for that tool_use)
-    // gets its tool_result content REPLACED with the search results.
-    // claude-code wrote a real file with the same body, but the model
-    // doesn't necessarily read the file back — putting the results
-    // inline in the tool_result is the reliable channel.
-    const enriched = toolResults.map((r) => {
-      const injected = consumeSpoofResult(r.tool_use_id);
-      if (injected !== undefined) {
-        log(`  ↪ spoof-result injection: tool_use_id=${r.tool_use_id} replacing ${r.text ? r.text.length + 'B ack' : 'empty ack'} with ${injected.length}B search payload`);
-        return { anthropic_tool_use_id: r.tool_use_id, content: injected };
-      }
-      return { anthropic_tool_use_id: r.tool_use_id, content: r.text };
-    });
-    log(`  → pool send_tool_results requestId=${requestId} count=${enriched.length} ids=[${enriched.map(r => r.anthropic_tool_use_id).join(', ')}]`);
+    log(`  → pool send_tool_results requestId=${requestId} count=${toolResults.length} ids=[${toolResults.map(r => r.tool_use_id).join(', ')}]`);
     poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
       model: model || null,
-      results: enriched,
+      results: toolResults.map((r) => ({
+        anthropic_tool_use_id: r.tool_use_id,
+        content: r.text,
+      })),
     });
   } else {
     // Mode selection: in `full` mode, render the ENTIRE messages[] into
