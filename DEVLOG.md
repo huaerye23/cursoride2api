@@ -1740,6 +1740,121 @@ committed `niah-test.mjs`; full results in `NIAH_RESULTS.md`.
 
 ---
 
+## 2026-05-15 (evening) — search-query workflow stabilization + real-search injection
+
+### Problem statement
+
+User's `claude --dangerously-skip-permissions --effort max --model claude-4.6-opus-max-thinking-fast` sessions failed instantly with:
+
+```
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request
+```
+
+on every "search online ..." query. Simple chat ("你好") worked. Failure was deterministic for any prompt that triggered tool emission on a thinking model.
+
+### Root causes (4 distinct bugs that compounded)
+
+1. **Duplicate `message_start` SSE events** (commit `9485e8e`)
+
+   Both the `route_decision` branch AND the `error` branch in api-server.mjs called `startMsg()` with the same guard `blockIdx === -1`. But `startMsg()` doesn't bump `blockIdx` — only `emitTextBlock`/`emitToolUseBlock` do. So when the pool fired an error event after `route_decision` (and before any content blocks), the error branch fired a SECOND `message_start`. claude-code rejects two-message_start streams as malformed.
+
+   Fix: added a dedicated `messageStarted` boolean inside `startMsg()`; both call sites became idempotent.
+
+2. **Missing `thinking` content block for interleaved-thinking clients** (commit `65310a6`)
+
+   claude-code v2.1.143 with thinking models sends `?beta=true` + `anthropic-beta: interleaved-thinking-2025-05-14` + `thinking: {type: "enabled"}` in the body. Its parser requires a `thinking` content block before any `text` or `tool_use` block. We were emitting only `text`/`tool_use` (we capture upstream thinking text into a buffer for context re-injection but never forward as SSE blocks because we can't sign them). claude-code rejected the missing-thinking stream as malformed.
+
+   Fix: when `body.thinking.type === 'enabled'`, emit a placeholder `thinking` content block (empty initial + one short `thinking_delta` + one `signature_delta` with synthetic value) before the first content block. `placeholderThinkingEmitted` flag keeps it to one per turn. `renderContentBlocks` got a `thinking`/`redacted_thinking` case for round-trip rendering when claude-code echoes the block back. Cursor's bidi stream doesn't verify Anthropic signatures, so the synthetic signature is safe end-to-end.
+
+3. **Error path SSE shape** (commit `484966d`)
+
+   On `pool error` events the api-server was emitting `event: error` THEN `event: message_delta` (stop_reason=end_turn) THEN `event: message_stop`. Anthropic's real SSE for errors just emits `event: error` and closes the stream. claude-code treats the extra trailing events as malformed, stacking a second "empty or malformed response" error on top of the original.
+
+   Fix: error branch now sends `event: error`, then inlines what `finishMessage()` used to do (set `done = true`, disarm watchdog, commit thinking turn, `res.end()`, delete handler) — no `message_delta`/`message_stop`.
+
+4. **`lastActivityAt` race in bridge-worker** (commit `d411c79`)
+
+   bridge-worker's busy-entry sites had:
+
+   ```js
+   setState('busy');            // ships IPC with OLD lastActivityAt
+   lastActivityAt = Date.now(); // updates AFTER setState
+   ```
+
+   `setState` reads the global `lastActivityAt` at call time and ships it. Pool-manager's IPC handler did `ch.lastActivityAt = msg.lastActivityAt || ch.lastActivityAt`, overwriting the fresh `routeRequest` timestamp with the stale worker value. Result: any channel that had been ready a while looked like "stuck busy 365s" THE INSTANT it was routed to — busy-watchdog killed it, error event fired, the SSE went malformed via (3).
+
+   Fix: swap order in all 4 busy-entry sites in `bridge-worker.mjs` (`send_user_message`, `send_tool_result`, `send_tool_results`, health-check); also added a defensive `Math.max` guard in `pool-manager.mjs` so any future similar race can't roll the clock backward.
+
+### Verified end-to-end fix
+
+After all four fixes, `claude --dangerously-skip-permissions --effort max --model claude-4.6-opus-max-thinking-fast -p "search online ..."` completes with `is_error: false` and produces coherent answers. The duplicate-`message_start` and stuck-busy patterns are gone.
+
+### New feature: real web search injection
+
+After the four bug fixes the channel was healthy but the search content was still confabulated — the model emitted `Write` to `agent-tools/<uuid>.txt` (the spoof pattern, see `AGENT_TOOLS_SPOOF_OBSERVATION.md`) and got back claude-code's 148-byte "File created" ack. No actual web data ever reached the model.
+
+Commit `fa4ca3b` added a Bing RSS injection path in `scaffolding/pool/spoof-mitigation.mjs` + `api-server.mjs`:
+
+- On detecting empty `Write → agent-tools/<uuid-v4>.txt`, the proxy launches an async Bing RSS search keyed by `tool_use_id`, stored in a bounded FIFO `spoofResultPlaybook` (256 entries).
+- Tool_use forwarding is NOT blocked — search runs in parallel with claude-code's local Write (~10 ms vs ~130 ms).
+- The await happens in `send_tool_results` (naturally async): `Promise.race` against a 5 s timeout, then REPLACE the tool_result content with the real search payload. If search fails/times out, the unmodified ack flows through.
+- `resultsLookGeneric()` quality gate falls back to the proxy_notice text when Bing returns only generic-host snippets (search engines, dictionaries) — avoids feeding the model noise.
+
+This is the THIRD attempt at injecting search results into the tool_result body. Prior two were `3c2f017` and `4984888`, which synthesized tool_results WITHOUT the claude-code roundtrip and killed channels. The current commit `fa4ca3b` works because it goes THROUGH claude-code: the Write tool_use shape is unchanged, the channel sees a normal tool_result POST, the proxy intercepts the content at forwarding time.
+
+### Open issue: native InteractionQuery WebSearch is broken
+
+Cursor's backend has its own WebSearch tool that fires via `interactionQuery.webSearchRequestQuery` when the model emits a native WebSearch call. The handler in `src/cursor-agent.js:866` auto-approves (`RATLC_PASSTHROUGH_NATIVE=1`) and Cursor's backend performs the search server-side, streaming results back via `webSearchToolCall`.
+
+**This path has NEVER fired successfully on this proxy build.**
+
+- `grep -c "webSearchToolCall complete" /tmp/ratlc-pool.log` returns 0 across the entire log history.
+- One historical `interactionQuery case=undefined` log line exists (line 28723 of /tmp/ratlc-pool.log), with `tools=6` (smaller priming set). Our vendored proto knows `InteractionQuery` oneof fields 1–8 (id, web_search_request_query, ask_question_interaction_query, switch_mode_request_query, exa_search_request_query, exa_fetch_request_query, create_plan_request_query, setup_vm_environment_args). Cursor on current builds sends a NEWER case (field ≥9) — our decoder returns `query.case === undefined`, we hit the `default` branch, abandon the response, and the model gets nothing back.
+
+Earlier claims that the backend WebSearch was firing (based on plausible-looking URLs like `ofox.ai/blog/llm-leaderboard-best-ai-models-ranked-2026/` in model output) were wrong — those URLs were hallucinated by the model from training-data patterns. The user clicked one of them and it existed, but that was coincidence; the model never fetched it. Confirmed by 0 `webSearchToolCall` events in the pool log.
+
+### Diagnostic logging in place for the native fix
+
+Commit `fa4ca3b` also added a hex dumper in the `default` branch of `handleInteractionQuery`. When the unknown case fires next time, the pool log will contain:
+
+```
+[cursor-agent][unknown-iq] id=<n> bytes(<len>)=<full-hex-dump>
+[cursor-agent][unknown-iq] tags=[{"fieldNum":1,"wireType":0,...},{"fieldNum":<N>,"wireType":2,...}]
+```
+
+I verified (via a synthetic round-trip test) that `toBinary(InteractionQuerySchema, iq)` preserves unknown fields byte-identically when the proto runtime sees an unknown field number. So the dump WILL contain the unknown-case bytes — we'll be able to read off the field number directly and decode the payload manually using wire format.
+
+### Why the native path rarely fires on this proxy
+
+`tool-translator.mjs:178 defaultTranslateModeTools()` only registers 6 priming tools with Cursor at channel-open time:
+`bajie_yield`, `search_codebase`, `Edit`, `Glob`, `NotebookEdit`, `TodoWrite`. Per-request claude-code tools (Write, Read, Bash, etc.) are NOT propagated to Cursor's backend. The model on Cursor's side has access to:
+
+- The 6 priming tools (none useful for web search)
+- Cursor's built-in tools (which include native WebSearch, but only fires interactionQuery — currently broken)
+- Cursor's built-in `Write` tool, which the model uses for the spoof pattern
+
+So when asked to search, the model usually picks Write-spoof (works via our Bing injection). Sometimes it picks native WebSearch (interactionQuery, currently broken). The route choice is non-deterministic; the Write-spoof was dominant in all sessions tested today.
+
+### Workflow for picking this back up
+
+1. Run `claude --dangerously-skip-permissions --effort max --model <thinking-model>` and try various search prompts until `grep "unknown-iq" /tmp/ratlc-pool.log` returns a hit (may take several attempts because the model usually picks Write-spoof).
+2. From the hex dump, identify the new field number (look at the `tags=[...]` JSON for the first field with `fieldNum >= 9`).
+3. Decode the payload bytes manually using protobuf wire format — the inner message is probably a sibling of `WebSearchRequestQuery` with a similar shape (`searchTerm` field, etc.).
+4. Two integration paths:
+   - **Clean**: regenerate `src/proto/agent_pb.mjs` from an up-to-date Cursor `.proto` file (we don't have one — would need to extract from a current Cursor IDE binary).
+   - **Hacky**: hand-parse the unknown field bytes in `handleInteractionQuery`'s default branch, construct an `InteractionResponse` manually with the right (possibly also new) response oneof case.
+5. Response shape: first try `WebSearchRequestResponseSchema` with `approved` — Cursor may have kept the response side stable. If the model still doesn't get results, the response schema is probably also new.
+
+### Commits today
+
+- `9485e8e` `fix(api-server): gate startMsg on messageStarted, not blockIdx === -1`
+- `65310a6` `fix(api-server): emit placeholder thinking block for interleaved-thinking clients`
+- `484966d` `fix(api-server): close SSE stream after error event, no trailing message_stop`
+- `d411c79` `fix(pool): lastActivityAt race that killed freshly-routed channels`
+- `fa4ca3b` `feat: real web search injection for Write-spoof + unknown-iq diagnostic logging`
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).

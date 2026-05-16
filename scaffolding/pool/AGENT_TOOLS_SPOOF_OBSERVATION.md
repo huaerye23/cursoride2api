@@ -88,3 +88,35 @@ Top 4 are statistically tied (overlapping CIs). Calling any single model "SOTA" 
 - `/root/Dropbox/common_codes_streamed/monolithicv/agent-tools/*.txt` -- the empty spoof files (9 of them, all 0 bytes, all written by me during this session and the one before it).
 - `WEBSEARCH_WEBFETCH_REVIEW.md` -- prior review that motivated this observation; Issue 2 is the relevant one.
 - `WATCHDOG_REARM_REVIEW.md` -- sibling review covering a separate finalize-timing issue.
+
+## Current end-state mitigation (commit `fa4ca3b`, 2026-05-15 evening)
+
+The Write-spoof pattern is the *de facto* WebSearch path on this proxy. Native InteractionQuery WebSearch is currently inert due to a proto-version mismatch (see DEVLOG entry for 2026-05-15 evening). Mitigation lives in `scaffolding/pool/spoof-mitigation.mjs` + `api-server.mjs`.
+
+**On spoof detection** (empty Write → `agent-tools/<uuid-v4>.txt`):
+
+1. **Static rewrite** of `msg.args.content` to a `proxy_notice` body (~907 B). claude-code's Write succeeds with non-empty content, channels stay healthy.
+2. **Async Bing RSS search** launched in parallel, keyed by `tool_use_id` in `spoofResultPlaybook` (FIFO, 256 entries max). NOT blocking the tool_use forwarding.
+
+**On the matching `tool_result` POST from claude-code** (~10 ms later for a local Write):
+
+- `consumeSpoofResult(tool_use_id)` `await`s the search promise with a 5 s timeout (`Promise.race`).
+- If results came back AND `resultsLookGeneric()` returns false, REPLACE the tool_result `content` with the Bing payload before forwarding to the pool.
+- Otherwise forward claude-code's normal ack (model just sees the proxy_notice as the file content, which steers it toward emitting WebSearch / Bash curl).
+
+This is the THIRD attempt at injecting search results into the tool_result body. Prior two (`3c2f017`, `4984888`) synthesized tool_results WITHOUT going through claude-code and killed channels. The current pattern works because the Write tool_use shape is unchanged — claude-code performs a normal Write and the channel sees a normal tool_result POST.
+
+### Prerequisites that had to land first
+
+Before `fa4ca3b` could ship cleanly, four other bugs had to be fixed (otherwise the synthetic-payload pattern destabilizes things):
+
+- `9485e8e` — `messageStarted` guard prevents duplicate `message_start` SSE events.
+- `65310a6` — placeholder `thinking` content block for interleaved-thinking clients (claude-code v2.1.143 with thinking models rejects responses missing it).
+- `484966d` — close SSE stream after `event: error` without trailing `message_delta`/`message_stop` (matches Anthropic's real API behavior; otherwise claude-code stacks a second "malformed response" error).
+- `d411c79` — bridge-worker must update `lastActivityAt` BEFORE `setState('busy')`, otherwise the IPC ships a stale timestamp that the pool-manager overwrites the fresh routeRequest timestamp with, causing the busy-watchdog to kill freshly-routed channels at 240 s+.
+
+### Limitations of the current mitigation
+
+- **Bing snippets are short.** Page titles + ~150 character excerpts. Numeric specifics (Elo scores, version numbers) frequently aren't in the snippet body; the model paraphrases what it sees and fills gaps with training data. For factual queries like "what's the latest version of node.js" this is usually fine. For specific-number queries like "what's the exact #1 Elo on lmarena right now" the model may still drift.
+- **No full-page fetch.** The proxy_notice tells the model to follow up with `Bash curl <URL>` for authoritative data, and the model now has real URLs from the Bing results to curl. But that's still a model judgment call.
+- **Native InteractionQuery WebSearch unreachable** until the proto is extended to handle field ≥9. See DEVLOG and the diagnostic logging in `handleInteractionQuery` default branch — next time the unknown case fires, hex bytes + tag breakdown will be logged.
