@@ -577,28 +577,75 @@ async function handleMessagesRequest(req, res) {
         // back to the inner agent by sending a tool_error result via
         // the pool socket — the agent picks a different approach.
 
-        // Note: there was a Write-spoof rejection here (commits 3c2f017
-        // and 4984888) that intercepted empty Write to
-        // `agent-tools/<uuid>.txt` — the model's known counterfeit-
-        // WebSearch pattern. BOTH shapes were tried live and BOTH caused
-        // *-thinking-fast model variants to hang silently after receiving
-        // the rejection: ch-43 (4 min HTTP stall), ch-58 (269 s busy-
-        // watchdog SIGTERM), ch-84 (130s silence and counting at the
-        // time of revert). The model's downstream plan after emitting
-        // the Write is structurally tied to expecting that file to
-        // exist with content; any tool_result that deviates from "the
-        // file we just wrote is real and has content" stalls it.
+        // Write-spoof MITIGATION (rewrite, not reject).
         //
-        // Decision: don't intercept. Let claude-code handle the Write
-        // (creates 0-byte file), let the model proceed with its
-        // confabulation pattern. Channels stay alive. Quality of model
-        // output degrades for that turn — the model narrates fake
-        // content from a real-but-empty file — but the model-side fix
-        // is not in this proxy's reach.
+        // History:
+        //   3c2f017: rejected the spoof with [proxy_error] tool_result
+        //            → killed ch-43 (4 min HTTP stall)
+        //   4984888: softened to success-shaped tool_result with hint
+        //            → killed ch-58 + ch-84 (240s busy-watchdog SIGTERM)
+        //   00ad168: reverted both → spoof completes silently, model
+        //            confabulates downstream
         //
-        // See AGENT_TOOLS_SPOOF_OBSERVATION.md for the diagnosis of the
-        // spoof pattern itself, and the discussion in DEVLOG.md for why
-        // we backed out the intercept.
+        // Both rejection attempts failed because the model's downstream
+        // plan is "I wrote a file, now I'll read it and quote." Any
+        // synthetic tool_result from the proxy breaks that plan and
+        // stalls the model for the rest of its thinking budget.
+        //
+        // The mitigation: don't reject. INSTEAD rewrite the `content`
+        // arg in-flight so claude-code writes a useful proxy notice into
+        // the file. The Write goes through normally, claude-code returns
+        // a real (non-synthetic) success result, the model stays alive.
+        // When the model later Reads the file (its trained next step),
+        // it gets our notice in the read content — context-injected
+        // guidance that may redirect the model toward a real fetch.
+        //
+        // Failure modes & their fates:
+        //   - Model reads notice → calls WebSearch / Bash curl  ✅ ideal
+        //   - Model reads notice → quotes it verbatim to user   ⚠ ugly
+        //     but at least it's not a confidently-wrong fake
+        //   - Model ignores notice → narrates around it         ⚠ same
+        //     as pre-rejection baseline; we did no harm
+        //   - Model hangs                                        N/A —
+        //     this is impossible because the tool_use & tool_result
+        //     come from claude-code in the normal shape; we never
+        //     synthesize one from the proxy.
+        //
+        // See AGENT_TOOLS_SPOOF_OBSERVATION.md for the spoof pattern
+        // diagnosis and DEVLOG.md for the iteration history.
+        if (msg.name === 'Write') {
+          const fp = msg.args?.file_path || '';
+          const content = msg.args?.content || '';
+          const uuidV4Path = /^agent-tools\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$/i;
+          if (uuidV4Path.test(fp) && String(content).trim() === '') {
+            const noticeBody =
+              '[proxy_notice — read this carefully]\n\n' +
+              'This file was created by a CLIENT-SIDE Write tool call, not by a real ' +
+              'web fetch. The path `agent-tools/<uuid>.txt` is the convention Cursor\'s ' +
+              'backend uses to write WebSearch results to disk on its OWN filesystem — ' +
+              'when you (the model) emit Write to this path, you are NOT triggering a ' +
+              'web fetch, you are just creating an empty file locally and getting a ' +
+              'success response.\n\n' +
+              'This is a known confabulation pattern. If you proceed to narrate web ' +
+              'content as if you had fetched it, you will be fabricating facts.\n\n' +
+              'WHAT TO DO INSTEAD:\n' +
+              '  - To search the web: emit a WebSearch tool_use with a `search_term`.\n' +
+              '  - To fetch a specific URL: emit a Bash tool_use with `curl -sL <url>`.\n' +
+              '  - If you cannot fulfill the user request without web access, tell the ' +
+              'user that and call `bajie_yield`.\n\n' +
+              'DO NOT quote this proxy_notice as if it were search results. DO NOT ' +
+              'fabricate web content.';
+            log(`⚠ Write-spoof intercept: rewriting empty Write→${fp} content with proxy_notice (${noticeBody.length}B) requestId=${requestId}`);
+            // Mutate the args in place so the normal forwarding path
+            // below picks up the new content. The shape stays identical
+            // to a regular Write — file_path unchanged, content now
+            // non-empty. claude-code writes the notice to the file and
+            // returns its standard success result.
+            msg.args = { ...msg.args, content: noticeBody };
+            // Intentionally fall through to the standard translate /
+            // contract forwarding logic — DO NOT return early.
+          }
+        }
 
         if (POOL_TOOL_MODE === 'translate' && !isInternalTool(msg.name)) {
           const xlated = cursorToAnthropic(msg.name, msg.args || {});
