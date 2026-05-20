@@ -700,6 +700,14 @@ async function handleMessagesRequest(req, res) {
     }
   }
 
+  function shouldSoftenPoolError(message) {
+    const text = String(message || '');
+    return /unknown anthropic_tool_use_id/i.test(text)
+      || /tool_use_ids span multiple channels/i.test(text)
+      || /channel .* died/i.test(text)
+      || /busy-watchdog timeout/i.test(text);
+  }
+
   function finishMessage() {
     if (done) return;
     done = true;
@@ -1007,6 +1015,14 @@ async function handleMessagesRequest(req, res) {
         finishMessage();
       } else if (msg.type === 'error') {
         completeOpenServerTools('The response ended with an error before Cursor exposed WebSearch result metadata.');
+        if (shouldSoftenPoolError(msg.message)) {
+          log(`  → soften pool error as text requestId=${requestId}: ${String(msg.message || '').slice(0, 180)}`);
+          startMsg();
+          emitTextDelta(`[proxy_notice] ${msg.message}. This usually means the client retried or replayed a stale tool_result after the proxy had already consumed it. Please send a fresh user message to continue.\n`);
+          stopReason = 'end_turn';
+          finishMessage();
+          return;
+        }
         // Anthropic's real SSE for errors emits ONLY `event: error` and
         // closes the stream. NO message_delta + message_stop afterwards.
         // claude-code's parser treats an SSE that contains an `error`
@@ -1015,7 +1031,6 @@ async function handleMessagesRequest(req, res) {
         // (HTTP 200)" error on top of the original error message. So we
         // emit the error event, close the stream, and skip finishMessage.
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
-        startMsg(); // idempotent now via the messageStarted guard
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
         done = true;
         disarmToolUseFinalizer();
