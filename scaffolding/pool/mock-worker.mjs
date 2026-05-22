@@ -15,10 +15,13 @@
 // Purpose: lets the multi-group routing tests verify pool-manager's
 // dispatch logic without paying the Cursor /Run retry lottery.
 
+import fs from 'node:fs';
+
 const CHANNEL_ID = process.env.RATLC_CHANNEL_ID || 'ch-?';
 const MODEL = process.env.RATLC_MODEL || 'mock-model';
 const READY_DELAY_MS = parseInt(process.env.MOCK_READY_DELAY_MS || '50', 10);
 const TURN_DELAY_MS = parseInt(process.env.MOCK_TURN_DELAY_MS || '25', 10);
+const STALL_ONCE_FILE = process.env.MOCK_STALL_ONCE_FILE || '';
 
 let openedAt = 0;
 
@@ -76,6 +79,16 @@ process.on('message', (msg) => {
   if (msg.type === 'send_user_message' || msg.type === 'send_native_image_message' || msg.type === 'send_tool_result' || msg.type === 'send_tool_results') {
     setState('busy');
     setTimeout(() => {
+      if (STALL_ONCE_FILE && msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_STALL_ONCE__')) {
+        try {
+          if (!fs.existsSync(STALL_ONCE_FILE)) {
+            fs.writeFileSync(STALL_ONCE_FILE, CHANNEL_ID);
+            return;
+          }
+        } catch {
+          return;
+        }
+      }
       if (msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_TOOL_USE__')) {
         send({
           type: 'tool_use',

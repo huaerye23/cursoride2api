@@ -546,6 +546,7 @@ function spawnChannel(group) {
     currentRequestId: null,
     pendingExecId: null,
     pendingAnthropicId: null,
+    abandonedRequestIds: new Set(),
     roundsServed: 0,
     error: null,
   };
@@ -708,6 +709,10 @@ function maybeSpawnNext() {
 function forwardToClient(ch, msg) {
   const reqId = msg.requestId;
   if (!reqId) return;
+  if (ch.abandonedRequestIds?.has(reqId)) {
+    log(`req ${reqId}: ignoring ${msg.type} from abandoned channel ${ch.id}`);
+    return;
+  }
   const client = requestClient.get(reqId);
   if (!client) return;
 
@@ -788,9 +793,22 @@ function pickReadyChannelInGroup(g) {
   return best;
 }
 
+function pickReadyChannelInGroupAvoiding(g, avoidChannelId) {
+  if (!avoidChannelId) return pickReadyChannelInGroup(g);
+  let best = null;
+  for (const channelId of g.channels) {
+    if (channelId === avoidChannelId) continue;
+    const ch = channels.get(channelId);
+    if (!ch || ch.state !== 'ready') continue;
+    if (!best || ch.lastActivityAt < best.lastActivityAt) best = ch;
+  }
+  return best;
+}
+
 function pickStickyReadyChannel(job, g) {
   const sticky = getSessionAffinity(job.sessionKey);
   if (!sticky || sticky.group !== g.model) return null;
+  if (job.avoidChannelId && sticky.channelId === job.avoidChannelId) return null;
   const ch = channels.get(sticky.channelId);
   if (!ch || ch.state !== 'ready' || ch.group !== g.model) return null;
   sticky.lastAccessMs = Date.now();
@@ -804,7 +822,7 @@ function tryPickForJob(job) {
   if (requestedModel) {
     const g = groups.get(requestedModel);
     if (g && !g.draining) {
-      const ch = pickStickyReadyChannel(job, g) || pickReadyChannelInGroup(g);
+      const ch = pickStickyReadyChannel(job, g) || pickReadyChannelInGroupAvoiding(g, job.avoidChannelId);
       if (ch) {
         return { channel: ch, servedModel: g.model, fallback: false, fallbackReason: null };
       }
@@ -817,7 +835,7 @@ function tryPickForJob(job) {
       job.fallbackReason = g ? 'group-draining' : 'unknown-model';
     }
   }
-  const ch = pickStickyReadyChannel(job, dflt) || pickReadyChannelInGroup(dflt);
+  const ch = pickStickyReadyChannel(job, dflt) || pickReadyChannelInGroupAvoiding(dflt, job.avoidChannelId);
   if (ch) {
     const fallback = !!requestedModel && requestedModel !== dflt.model;
     return {
@@ -872,7 +890,7 @@ function clearJobTimers(job) {
   if (job.queueTimer) { clearTimeout(job.queueTimer); job.queueTimer = null; }
 }
 
-function cancelRequest(requestId, reason = 'cancelled') {
+function cancelRequest(requestId, reason = 'cancelled', opts = {}) {
   if (!requestId) return false;
   for (let i = 0; i < requestQueue.length; i++) {
     const job = requestQueue[i];
@@ -885,13 +903,18 @@ function cancelRequest(requestId, reason = 'cancelled') {
   }
   for (const ch of channels.values()) {
     if (ch.currentRequestId !== requestId) continue;
-    requestClient.delete(requestId);
+    if (!opts.silent) {
+      requestClient.delete(requestId);
+    } else {
+      ch.abandonedRequestIds.add(requestId);
+      ch.currentRequestId = null;
+    }
     clearPendingToolUsesForChannel(ch.id);
-    log(`req ${requestId}: cancelling active channel ${ch.id} (${reason})`);
+    log(`req ${requestId}: cancelling active channel ${ch.id} (${reason})${opts.silent ? ' silently' : ''}`);
     try { ch.proc.kill('SIGTERM'); } catch { /* ignore */ }
     return true;
   }
-  requestClient.delete(requestId);
+  if (!opts.silent) requestClient.delete(requestId);
   return false;
 }
 
@@ -904,7 +927,7 @@ function drainQueue() {
       let pick;
       if (job.fallbackArmed) {
         const dflt = getDefaultGroup();
-        const ch = dflt ? pickReadyChannelInGroup(dflt) : null;
+        const ch = dflt ? pickReadyChannelInGroupAvoiding(dflt, job.avoidChannelId) : null;
         if (ch) {
           pick = { channel: ch, servedModel: dflt.model, fallback: true, fallbackReason: job.fallbackReason || 'unknown-model' };
         }
@@ -1040,7 +1063,7 @@ function writeToClient(client, obj) {
 
 function handleClientMessage(client, msg) {
   if (msg.type === 'request') {
-    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model, requestedModel, sessionKey, contextMode, hybridReason } = msg;
+    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model, requestedModel, sessionKey, contextMode, hybridReason, avoidChannelId } = msg;
 
     if (action === 'send_user_message' || action === 'send_native_image_message') {
       if (POOL_TOOL_MODE === 'contract') {
@@ -1078,6 +1101,7 @@ function handleClientMessage(client, msg) {
         sessionKey: sessionKey || null,
         contextMode: contextMode || null,
         hybridReason: hybridReason || null,
+        avoidChannelId: avoidChannelId || null,
         queuedAt: Date.now(),
         waitTimer: null,
         queueTimer: null,
@@ -1198,7 +1222,7 @@ function handleClientMessage(client, msg) {
 	  }
 
 	  if (msg.type === 'cancel_request') {
-	    cancelRequest(msg.requestId, msg.reason || 'cancel_request');
+	    cancelRequest(msg.requestId, msg.reason || 'cancel_request', { silent: msg.silent === true });
 	    return;
 	  }
 

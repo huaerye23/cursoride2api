@@ -78,6 +78,50 @@ be stream-scoped, and replaying a checkpoint on a fresh stream can fail with
 `Blob not found`. For compatibility clients, the safer strategy is to rebuild
 context from the client's transcript and only cache replay-safe metadata.
 
+### Cursor Native Context Management vs RATLC Delivery
+
+Cursor's own agent flow has context-management layers that are not equivalent
+to simply waiting for a giant request to fit:
+
+- automatic summarization near the context limit, plus manual `/summarize`;
+- history-as-file / reversible context discovery, where summarized-away source
+  material can be re-read later;
+- large tool output written to files instead of injected directly;
+- partial file reads by default, with explicit follow-up reads for more detail;
+- checkpoints and model-specific summarization behavior in Composer.
+
+The RATLC pool path currently bypasses most of that. In `POOL_CONTEXT_MODE=full`
+the API renders Claude Code's complete `messages[]` transcript into one giant
+prompt and delivers it through a warm Cursor channel as a `bajie_yield`
+tool_result. Cursor then sees a single large tool-result payload, not a native
+conversation whose history, files, and tool outputs it can compact using its
+own policy. This is the root cause of the observed stalls on large turns: the
+delivery shape disables Cursor's native context governance and amplifies
+transport latency, parser gaps, and model-side long-context cost.
+
+`RATLC_CONTEXT_MAX_BYTES` therefore belongs only to `POOL_CONTEXT_MODE=hybrid`.
+Hybrid is a performance/stability mode and may downgrade a too-large first
+full turn to sticky `last` delivery. `POOL_CONTEXT_MODE=full` is correctness
+mode: it must not silently cap or drop history. If full-mode payloads stall,
+the first-line mitigation is channel-level watchdog/retry; the real long-term
+fix is to stop sending the full transcript inline.
+
+Target replacement for inline full payloads:
+
+1. Render the client transcript into a durable context snapshot.
+2. Send a small manifest through `bajie_yield` containing snapshot id, message
+   count, byte count, final user turn, chunk metadata, and instructions.
+3. Expose pool-local tools such as `ratlc_context_read`,
+   `ratlc_context_search`, `ratlc_context_get_message`,
+   `ratlc_context_get_tool_result`, and `ratlc_context_get_image`.
+4. Keep full-context semantics by making all original material retrievable,
+   while keeping each Cursor turn small enough for transport and tool-result
+   parsers.
+
+This mirrors Cursor's history-as-file and large-output-to-file behavior at the
+RATLC compatibility layer instead of relying on Cursor to compact an opaque
+tool_result that it does not own.
+
 ### Practical Consequences
 
 - Cursor-native path: preserve stream/session affinity where possible. Cache

@@ -31,6 +31,8 @@
 //     and the result content is free-form). Mostly a no-op; included for
 //     symmetry.
 
+import { contextToolDefinitions } from './context-store.mjs';
+
 // ── 1. Name table ───────────────────────────────────────────────────────
 // Cursor name → Anthropic/claude-code name.
 // Tools with the same name on both sides aren't listed here — passthrough.
@@ -229,6 +231,7 @@ export function defaultTranslateModeTools() {
         required: ['tool_name', 'input'],
       },
     },
+    ...contextToolDefinitions(),
     // Anthropic `Edit` — alias for Cursor's `StrReplace` but with the exact
     // schema claude-code emits. Receives via mcpArgs(toolName="Edit").
     {

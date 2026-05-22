@@ -35,6 +35,11 @@ import {
   normalizeAnthropicContentForCursorMcp,
   prependTextContent,
 } from './multimodal-content.mjs';
+import {
+  createContextSnapshot,
+  renderContextManifestPrompt,
+  shouldUseContextManifest,
+} from './context-store.mjs';
 
 // Bridge to the existing CommonJS anthropic-tools helpers so we can reuse
 // `deriveConversationKey` and `extractClientSessionId` instead of porting
@@ -84,16 +89,19 @@ if (!['full', 'last', 'hybrid'].includes(POOL_CONTEXT_MODE)) {
   process.exit(1);
 }
 const HYBRID_SESSION_TTL_MS = Math.max(60_000, parseInt(process.env.POOL_HYBRID_SESSION_TTL_MS || '1800000', 10));
-// Safety valve for clients such as Claude Code that echo complete messages[]
-// history, tool results, and optional thinking back on every turn. Sending a
-// very large full-context payload as a bajie_yield tool_result can make Cursor
-// close or stall the live session. When full rendering crosses this byte-ish
-// character limit, fall back to sticky last-turn delivery for that request.
-// Set to 0 to disable.
+// Hybrid-mode safety valve for clients such as Claude Code that echo complete
+// messages[] history, tool results, and optional thinking back on every turn.
+// In POOL_CONTEXT_MODE=hybrid only, a full-context turn crossing this byte-ish
+// limit falls back to sticky last-turn delivery. POOL_CONTEXT_MODE=full always
+// sends full context; stalls there must be handled below transport/model level,
+// not by silently dropping history.
+// Set to 0 to disable the hybrid guard.
 const CONTEXT_MAX_BYTES = Math.max(0, parseInt(process.env.RATLC_CONTEXT_MAX_BYTES || process.env.POOL_CONTEXT_MAX_BYTES || '98304', 10));
+const NO_VISIBLE_EVENT_RETRIES = Math.max(0, parseInt(process.env.RATLC_NO_VISIBLE_EVENT_RETRIES || '1', 10));
+const CONTEXT_MANIFEST_THRESHOLD_BYTES = Math.max(0, parseInt(process.env.RATLC_CONTEXT_MANIFEST_THRESHOLD_BYTES || '262144', 10));
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
-log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}  POOL_PROXY_THINKING_BLOCKS=${POOL_PROXY_THINKING_BLOCKS ? 1 : 0}  CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES}`);
+log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}  POOL_PROXY_THINKING_BLOCKS=${POOL_PROXY_THINKING_BLOCKS ? 1 : 0}  CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES}  CONTEXT_MANIFEST_THRESHOLD_BYTES=${CONTEXT_MANIFEST_THRESHOLD_BYTES}  NO_VISIBLE_EVENT_RETRIES=${NO_VISIBLE_EVENT_RETRIES}`);
 
 const REQUEST_LOG_MAX = Math.max(100, parseInt(process.env.RATLC_REQUEST_LOG_MAX || '500', 10));
 const requestLog = [];
@@ -704,6 +712,8 @@ async function handleMessagesRequest(req, res) {
   let messageStarted = false;
   let visibleUpstreamEventSeen = false;
   let noVisibleEventTimer = null;
+  let noVisibleEventRetryCount = 0;
+  let currentPoolRequest = null;
   const NO_VISIBLE_EVENT_TIMEOUT_MS = Math.max(5_000, parseInt(
     process.env.RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS || '25000',
     10,
@@ -759,12 +769,42 @@ async function handleMessagesRequest(req, res) {
     noVisibleEventTimer = setTimeout(() => {
       noVisibleEventTimer = null;
       if (done || visibleUpstreamEventSeen) return;
-      log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}`);
+      if (currentPoolRequest && noVisibleEventRetryCount < NO_VISIBLE_EVENT_RETRIES) {
+        noVisibleEventRetryCount++;
+        const timedOutChannel = routedChannel || null;
+        log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}; retry ${noVisibleEventRetryCount}/${NO_VISIBLE_EVENT_RETRIES}${timedOutChannel ? ` after ${timedOutChannel}` : ''}`);
+        patchRequest(requestId, {
+          status: 'retrying_no_visible_event',
+          noVisibleEventRetryCount,
+          lastTimedOutChannel: timedOutChannel,
+          lastNoVisibleEventTimeoutAt: Date.now(),
+        });
+        if (timedOutChannel) {
+          poolWrite({
+            type: 'cancel_request',
+            requestId,
+            reason: `no_visible_event_timeout:${NO_VISIBLE_EVENT_TIMEOUT_MS}`,
+            silent: true,
+          });
+        }
+        routedTo = null;
+        routedChannel = null;
+        routeFallback = false;
+        routeFallbackReason = null;
+        poolWrite({
+          ...currentPoolRequest,
+          retryOf: requestId,
+          retryAttempt: noVisibleEventRetryCount,
+          avoidChannelId: timedOutChannel,
+        });
+        return;
+      }
+      log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}; no retries left`);
       finalStatusOverride = 'upstream_no_visible_event_timeout';
       finalErrorMessage = `No visible Cursor event within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms after routing`;
       emitTextDelta(
         `[proxy_notice] Cursor upstream accepted the request but did not emit text, thinking, tool_use, yield, or error within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms. ` +
-        'The RATLC channel was likely waiting on an unrecognized Cursor exec message. Please retry after the channel is recycled.\n'
+        `Retried ${noVisibleEventRetryCount} time(s) before giving up. The RATLC channel was likely waiting on an unrecognized Cursor exec message or a stalled oversized payload.\n`
       );
       stopReason = 'end_turn';
       finishMessage();
@@ -1210,6 +1250,7 @@ async function handleMessagesRequest(req, res) {
         routedChannel = msg.channelId || null;
         routeFallback = !!msg.fallback;
         routeFallbackReason = msg.fallbackReason || null;
+        if (messageStarted) sseWrite(res, 'ping', { type: 'ping' });
         patchRequest(requestId, {
           status: 'routed',
           routedAt: Date.now(),
@@ -1217,6 +1258,7 @@ async function handleMessagesRequest(req, res) {
           servedModel: routedTo,
           fallback: routeFallback,
           fallbackReason: routeFallbackReason,
+          noVisibleEventRetryCount,
         });
         const extra = {};
         if (routedTo) extra['x-ratlc-routed-to'] = routedTo;
@@ -1794,7 +1836,9 @@ async function handleMessagesRequest(req, res) {
       ? decideHybridContext({ clientSessionId, convKey, routingModel, system, tools, messages })
       : null;
     let effectiveContextMode = hybrid ? hybrid.sendMode : POOL_CONTEXT_MODE;
+    const hybridFullGuardEnabled = POOL_CONTEXT_MODE === 'hybrid' && hybrid?.sendMode === 'full';
     let contextGuardReason = null;
+    let contextManifest = null;
     let text;
     let content;
     const lastUserContent = buildLastUserCursorMcpContent(lastMsg.content, thinkingTurns);
@@ -1802,7 +1846,7 @@ async function handleMessagesRequest(req, res) {
       content = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns });
       text = cursorMcpContentToText(content);
       const imageFullContentBytes = cursorMcpContentPayloadBytes(content);
-      if (CONTEXT_MAX_BYTES > 0 && imageFullContentBytes > CONTEXT_MAX_BYTES) {
+      if (hybridFullGuardEnabled && CONTEXT_MAX_BYTES > 0 && imageFullContentBytes > CONTEXT_MAX_BYTES) {
         contextGuardReason = `image-full-context-too-large:${imageFullContentBytes}>${CONTEXT_MAX_BYTES}`;
         content = lastUserContent;
         text = cursorMcpContentToText(content);
@@ -1813,7 +1857,7 @@ async function handleMessagesRequest(req, res) {
     } else if (effectiveContextMode === 'full') {
       content = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns });
       text = cursorMcpContentToText(content);
-      if (CONTEXT_MAX_BYTES > 0 && text.length > CONTEXT_MAX_BYTES) {
+      if (hybridFullGuardEnabled && CONTEXT_MAX_BYTES > 0 && text.length > CONTEXT_MAX_BYTES) {
         contextGuardReason = `full-context-too-large:${text.length}>${CONTEXT_MAX_BYTES}`;
         content = lastUserContent;
         text = cursorMcpContentToText(content);
@@ -1823,11 +1867,29 @@ async function handleMessagesRequest(req, res) {
       content = lastUserContent;
       text = cursorMcpContentToText(content);
     }
+    if (shouldUseContextManifest({
+      mode: effectiveContextMode,
+      textBytes: Buffer.byteLength(text || '', 'utf8'),
+      imageCount: cursorMcpContentImageCount(content),
+      threshold: CONTEXT_MANIFEST_THRESHOLD_BYTES,
+    })) {
+      contextManifest = await createContextSnapshot({
+        text,
+        messages,
+        system,
+        tools,
+        finalUserText: extractTextFromContent(lastMsg.content),
+        renderContentBlocks,
+      });
+      text = renderContextManifestPrompt(contextManifest);
+      content = { items: [{ kind: 'text', text }] };
+      effectiveContextMode = 'full_manifest';
+    }
     const sessionKey = hybrid?.sessionKey || makeSessionKey({ clientSessionId, convKey, routingModel });
     const imageCount = cursorMcpContentImageCount(content);
     const poolAction = 'send_user_message';
     const contentBytes = cursorMcpContentPayloadBytes(content);
-    log(`  → pool ${poolAction} requestId=${requestId} model=${model || '(default)'} routeModel=${routingModel || '(default)'} mode=${POOL_CONTEXT_MODE}${hybrid ? '/' + hybrid.sendMode + ' reason=' + hybrid.reason : ''}${contextGuardReason ? ' guard=' + contextGuardReason : ''} sessionKey=${sessionKey || '(none)'} textBytes=${text.length} contentBytes=${contentBytes} images=${imageCount} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
+    log(`  → pool ${poolAction} requestId=${requestId} model=${model || '(default)'} routeModel=${routingModel || '(default)'} mode=${POOL_CONTEXT_MODE}${hybrid ? '/' + hybrid.sendMode + ' reason=' + hybrid.reason : ''}${contextGuardReason ? ' guard=' + contextGuardReason : ''}${contextManifest ? ' manifest=' + contextManifest.snapshotId : ''} sessionKey=${sessionKey || '(none)'} textBytes=${text.length} contentBytes=${contentBytes} images=${imageCount} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
     patchRequest(requestId, {
       status: 'forwarded',
       forwardedAt: Date.now(),
@@ -1839,9 +1901,12 @@ async function handleMessagesRequest(req, res) {
       textBytes: text.length,
       contentBytes,
       imageCount,
+      contextManifestSnapshotId: contextManifest?.snapshotId || null,
+      contextManifestTotalBytes: contextManifest?.totalBytes || null,
+      contextManifestChunks: contextManifest?.chunks?.length || null,
       reinjectTurns: thinkingTurns.length,
     });
-    poolWrite({
+    currentPoolRequest = {
       type: 'request', requestId, action: poolAction,
       model: routingModel || null,
       requestedModel: model || null,
@@ -1852,7 +1917,8 @@ async function handleMessagesRequest(req, res) {
       sessionKey: sessionKey || null,
       contextMode: effectiveContextMode,
       hybridReason: contextGuardReason || hybrid?.reason || null,
-    });
+    };
+    poolWrite(currentPoolRequest);
   }
 
 	  function cancelForClientDisconnect() {

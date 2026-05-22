@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import { isContextToolName, runContextTool } from './context-store.mjs';
 
 const DEFAULT_CWD = process.env.RATLC_LOCAL_TOOL_CWD || process.cwd();
 const MAX_RESULTS = Math.max(1, parseInt(process.env.RATLC_LOCAL_TOOL_MAX_RESULTS || '2000', 10));
@@ -27,6 +28,7 @@ export function normalizePoolLocalToolName(name) {
   if (lower === 'glob') return 'Glob';
   if (lower === 'webfetch') return 'WebFetch';
   if (lower === 'fetch') return 'Fetch';
+  if (isContextToolName(unprefixed)) return unprefixed;
   return '';
 }
 
@@ -45,6 +47,9 @@ export async function runPoolLocalTool(name, args = {}, opts = {}) {
     }
     if (normalized === 'WebFetch' || normalized === 'Fetch') {
       return { ok: true, name: normalized, content: await runLocalWebFetch(args) };
+    }
+    if (isContextToolName(normalized)) {
+      return { ok: true, name: normalized, content: await runContextTool(normalized, args) };
     }
     return { ok: false, name: normalized || String(name || ''), content: `[proxy_error] Unsupported local tool: ${name || '(empty)'}` };
   } catch (e) {
